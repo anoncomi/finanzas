@@ -1,0 +1,1311 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Finanzas Personales</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+*{box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#f1f5f9}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-thumb{background:#94a3b8;border-radius:4px}
+input[type=number]::-webkit-inner-spin-button{opacity:1}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useMemo,useCallback,useRef}=React;
+
+/* ═══════════════════════════════════════════════
+   UTILS
+═══════════════════════════════════════════════ */
+const MESES=['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+const DIAS_SHORT=['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
+
+function uid(){return Math.random().toString(36).substr(2,9)}
+
+function fmt(n){
+  if(n==null||isNaN(n))return '$0.00';
+  return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN'}).format(n);
+}
+
+function fmtShort(n){
+  if(n==null||isNaN(n))return '$0';
+  const abs=Math.abs(n);
+  if(abs>=1000000)return `${(n/1000000).toFixed(1)}M`;
+  if(abs>=1000)return `${(n/1000).toFixed(1)}k`;
+  return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN',maximumFractionDigits:0}).format(n);
+}
+
+function fmtDate(s){
+  if(!s)return '';
+  const d=new Date(s+'T12:00:00');
+  return d.toLocaleDateString('es-MX',{day:'2-digit',month:'short',year:'numeric'});
+}
+
+function todayStr(){
+  const d=new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+function dateStr(d){
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+function addDays(dateS,n){
+  const d=new Date(dateS+'T12:00:00');
+  d.setDate(d.getDate()+n);
+  return dateStr(d);
+}
+
+function dayOfWeekMon(dateS){
+  // 1=Lun ... 7=Dom
+  const d=new Date(dateS+'T12:00:00');
+  const dow=d.getDay();
+  return dow===0?7:dow;
+}
+
+function calcTaxes(bruto){
+  const iva=bruto*0.16;
+  const isr=(bruto/1.16)*0.01;
+  return {iva,isr,total:iva+isr};
+}
+
+function shouldPayOn(ing,dateS){
+  const d=new Date(dateS+'T12:00:00');
+  const dom=d.getDate();
+  const dow=dayOfWeekMon(dateS);
+  const lastDom=new Date(d.getFullYear(),d.getMonth()+1,0).getDate();
+  switch(ing.frecuencia){
+    case'Semanal':   return dow===ing.diaCobro;
+    case'Quincenal': return dom===1||dom===15;
+    case'Mensual':   return dom===ing.diaCobro;
+    case'Fin de Mes':return dom===lastDom;
+    default:         return false;
+  }
+}
+
+// Like shouldPayOn but also handles 'Fecha específica' (one-time)
+function shouldExpenseOn(gr,dateS){
+  if(gr.frecuencia==='Fecha específica') return dateS===gr.fechaEspecifica;
+  return shouldPayOn(gr,dateS);
+}
+
+// Returns YYYY-MM-DD of the TDC payment date for a given cut-off month
+function tdcPayDate(diaCorte,diasGracia,year,month){
+  const co=new Date(year,month,diaCorte);
+  co.setDate(co.getDate()+diasGracia);
+  return dateStr(co);
+}
+
+/* ═══════════════════════════════════════════════
+   ENGINE: Compute running state from today → target
+═══════════════════════════════════════════════ */
+function computeState(targetS, saldoInicial, ingresos, gastos, tdc, gastosRec=[]){
+  const today=new Date(); today.setHours(0,0,0,0);
+  const target=new Date(targetS+'T12:00:00'); target.setHours(0,0,0,0);
+
+  let cash=saldoInicial;
+  let tdcBal=parseFloat(tdc.saldo)||0;
+  const taxByMonth={}; // 'YYYY-MM' -> accumulated taxes (received but not yet paid)
+  const paidTaxMonths=new Set();
+  const paidTDCDates=new Set();
+
+  for(let d=new Date(today);d<=target;d.setDate(d.getDate()+1)){
+    const ds=dateStr(new Date(d));
+    const mk=ds.substr(0,7); // YYYY-MM
+
+    // ── Ingresos ──
+    for(const ing of ingresos){
+      if(shouldPayOn(ing,ds)){
+        const t=calcTaxes(ing.montoBruto);
+        cash+=ing.montoBruto; // full gross deposited
+        taxByMonth[mk]=(taxByMonth[mk]||0)+t.total;
+      }
+    }
+
+    // ── Pago impuestos (día 1 de cada mes: pagar impuestos del mes anterior) ──
+    if(d.getDate()===1){
+      const pd=new Date(d); pd.setMonth(pd.getMonth()-1);
+      const pmk=dateStr(pd).substr(0,7);
+      if(taxByMonth[pmk]&&!paidTaxMonths.has(pmk)){
+        cash-=taxByMonth[pmk];
+        paidTaxMonths.add(pmk);
+      }
+    }
+
+    // ── Pago TDC automático ──
+    if(tdc.diaCorte&&tdc.diasGracia){
+      for(let mo=-1;mo<=1;mo++){
+        const checkD=new Date(d.getFullYear(),d.getMonth()+mo,parseInt(tdc.diaCorte));
+        const pd=tdcPayDate(parseInt(tdc.diaCorte),parseInt(tdc.diasGracia),checkD.getFullYear(),checkD.getMonth());
+        if(pd===ds&&!paidTDCDates.has(pd)&&tdcBal>0){
+          cash-=tdcBal;
+          tdcBal=0;
+          paidTDCDates.add(pd);
+          break;
+        }
+      }
+    }
+
+    // ── Gastos del día (puntuales) ──
+    for(const g of gastos){
+      if(g.fecha===ds){
+        if(g.tipoPago==='efectivo') cash-=g.monto;
+        else tdcBal+=g.monto;
+      }
+    }
+
+    // ── Gastos recurrentes ──
+    for(const gr of gastosRec){
+      if(shouldExpenseOn(gr,ds)){
+        if(gr.tipoPago==='efectivo') cash-=gr.monto;
+        else tdcBal+=gr.monto;
+      }
+    }
+  }
+
+  const mk=targetS.substr(0,7);
+  const committed=paidTaxMonths.has(mk)?0:(taxByMonth[mk]||0);
+
+  return {cash,tdcBal,committed,free:cash-committed};
+}
+
+/* ═══════════════════════════════════════════════
+   ENGINE: Generate event list for a date range
+═══════════════════════════════════════════════ */
+function getEvents(startS,endS,ingresos,gastos,tdc,gastosRec=[]){
+  const evts={}; // dateStr -> array of events
+  const start=new Date(startS+'T12:00:00');
+  const end=new Date(endS+'T12:00:00');
+
+  const push=(ds,ev)=>{if(!evts[ds])evts[ds]=[];evts[ds].push(ev)};
+
+  for(let d=new Date(start);d<=end;d.setDate(d.getDate()+1)){
+    const ds=dateStr(new Date(d));
+
+    // Ingresos
+    for(const ing of ingresos){
+      if(shouldPayOn(ing,ds)){
+        const t=calcTaxes(ing.montoBruto);
+        push(ds,{tipo:'ingreso',id:ing.id+ds,label:ing.nombre,
+          monto:ing.montoBruto,neto:ing.montoBruto-t.total,impuestos:t});
+      }
+    }
+
+    // Impuestos (día 1)
+    if(d.getDate()===1){
+      const pd=new Date(d); pd.setMonth(pd.getMonth()-1);
+      const pmk=dateStr(pd).substr(0,7);
+      let taxTotal=0;
+      const pStart=new Date(pd.getFullYear(),pd.getMonth(),1);
+      const pEnd=new Date(pd.getFullYear(),pd.getMonth()+1,0);
+      for(let pd2=new Date(pStart);pd2<=pEnd;pd2.setDate(pd2.getDate()+1)){
+        const ds2=dateStr(new Date(pd2));
+        for(const ing of ingresos){
+          if(shouldPayOn(ing,ds2)) taxTotal+=calcTaxes(ing.montoBruto).total;
+        }
+      }
+      if(taxTotal>0){
+        push(ds,{tipo:'impuestos',id:'tax-'+ds,
+          label:`Pago impuestos (${MESES[pd.getMonth()]} ${pd.getFullYear()})`,
+          monto:taxTotal});
+      }
+    }
+
+    // Pago TDC auto
+    if(tdc.diaCorte&&tdc.diasGracia){
+      for(let mo=-1;mo<=2;mo++){
+        const checkD=new Date(d.getFullYear(),d.getMonth()+mo,parseInt(tdc.diaCorte));
+        const pd=tdcPayDate(parseInt(tdc.diaCorte),parseInt(tdc.diasGracia),checkD.getFullYear(),checkD.getMonth());
+        if(pd===ds){
+          push(ds,{tipo:'pago_tdc',id:'tdcpay-'+ds,
+            label:`Pago TDC (corte día ${tdc.diaCorte})`,monto:parseFloat(tdc.saldo)||0,auto:true});
+          break;
+        }
+      }
+    }
+
+    // Gastos recurrentes
+    for(const gr of gastosRec){
+      if(shouldExpenseOn(gr,ds)){
+        push(ds,{tipo:gr.tipoPago==='tarjeta'?'gasto_rec_tarjeta':'gasto_rec_efectivo',
+          id:gr.id+ds,label:gr.nombre,monto:gr.monto,tipoPago:gr.tipoPago,recurrente:true});
+      }
+    }
+  }
+
+  // Gastos manuales
+  for(const g of gastos){
+    if(g.fecha>=startS&&g.fecha<=endS){
+      push(g.fecha,{tipo:g.tipoPago==='tarjeta'?'gasto_tdc':'gasto_efectivo',
+        id:g.id,label:g.descripcion,monto:g.monto,tipoPago:g.tipoPago});
+    }
+  }
+
+  return evts;
+}
+
+/* ═══════════════════════════════════════════════
+   UI PRIMITIVES
+═══════════════════════════════════════════════ */
+const EVT_STYLE={
+  ingreso:          {bg:'bg-emerald-50 border-emerald-200', dot:'bg-emerald-500',text:'text-emerald-700',icon:'💰'},
+  gasto_efectivo:   {bg:'bg-blue-50 border-blue-200',       dot:'bg-blue-500',   text:'text-blue-700',   icon:'💵'},
+  gasto_tdc:        {bg:'bg-purple-50 border-purple-200',   dot:'bg-purple-500', text:'text-purple-700', icon:'💳'},
+  gasto_rec_efectivo:{bg:'bg-sky-50 border-sky-200',        dot:'bg-sky-500',    text:'text-sky-700',    icon:'🔄'},
+  gasto_rec_tarjeta:{bg:'bg-violet-50 border-violet-200',   dot:'bg-violet-500', text:'text-violet-700', icon:'🔄'},
+  impuestos:        {bg:'bg-orange-50 border-orange-200',   dot:'bg-orange-500', text:'text-orange-700', icon:'🏛️'},
+  pago_tdc:         {bg:'bg-rose-50 border-rose-200',       dot:'bg-rose-500',   text:'text-rose-700',   icon:'💳'},
+};
+
+function Card({children,className=''}){
+  return <div className={`bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden ${className}`}>{children}</div>;
+}
+
+function SectionHeader({title,sub,icon,color='blue'}){
+  const g={blue:'from-blue-600 to-blue-800',green:'from-emerald-500 to-teal-600',
+           purple:'from-purple-600 to-violet-700',orange:'from-orange-500 to-amber-600',
+           red:'from-red-500 to-rose-600',slate:'from-slate-600 to-slate-800'};
+  return(
+    <div className={`bg-gradient-to-r ${g[color]} p-4`}>
+      <div className="flex items-center gap-2">
+        {icon&&<span className="text-2xl">{icon}</span>}
+        <div>
+          <h2 className="text-white font-bold text-lg leading-tight">{title}</h2>
+          {sub&&<p className="text-white/70 text-xs mt-0.5">{sub}</p>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StatBox({label,value,sub,color='blue',large}){
+  const c={blue:'bg-blue-50 border-blue-100 text-blue-700',
+           green:'bg-emerald-50 border-emerald-100 text-emerald-700',
+           red:'bg-red-50 border-red-100 text-red-700',
+           orange:'bg-orange-50 border-orange-100 text-orange-600',
+           purple:'bg-purple-50 border-purple-100 text-purple-700',
+           slate:'bg-slate-50 border-slate-200 text-slate-700'};
+  return(
+    <div className={`rounded-xl border p-3 text-center ${c[color]}`}>
+      <p className="text-xs font-medium opacity-70 mb-1">{label}</p>
+      <p className={`font-bold ${large?'text-2xl':'text-lg'}`}>{value}</p>
+      {sub&&<p className="text-xs opacity-60 mt-0.5">{sub}</p>}
+    </div>
+  );
+}
+
+function EventRow({ev}){
+  const s=EVT_STYLE[ev.tipo]||{bg:'bg-slate-50 border-slate-200',dot:'bg-slate-400',text:'text-slate-700',icon:'📌'};
+  const isPos=ev.tipo==='ingreso';
+  const isNeg=['gasto_efectivo','gasto_tdc','gasto_rec_efectivo','gasto_rec_tarjeta','impuestos','pago_tdc'].includes(ev.tipo);
+  return(
+    <div className={`flex items-center gap-3 p-3 rounded-xl border ${s.bg}`}>
+      <span className="text-lg">{s.icon}</span>
+      <div className="flex-1 min-w-0">
+        <p className={`font-semibold text-sm truncate ${s.text}`}>{ev.label}</p>
+        {ev.tipo==='ingreso'&&<p className="text-xs text-slate-400">Bruto {fmt(ev.monto)} · Imp {fmt(ev.impuestos?.total)}</p>}
+        {ev.tipo==='impuestos'&&<p className="text-xs text-slate-400">Pago automático el día 1</p>}
+        {ev.tipo==='pago_tdc'&&<p className="text-xs text-slate-400">Pago TDC agendado</p>}
+        {(ev.tipo==='gasto_efectivo'||ev.tipo==='gasto_tdc')&&<p className="text-xs text-slate-400">Gasto puntual · {ev.tipoPago==='tarjeta'?'Tarjeta':'Efectivo'}</p>}
+        {(ev.tipo==='gasto_rec_efectivo'||ev.tipo==='gasto_rec_tarjeta')&&<p className="text-xs text-slate-400">🔄 Recurrente · {ev.tipoPago==='tarjeta'?'Tarjeta':'Efectivo'}</p>}
+      </div>
+      {ev.monto!=null&&(
+        <span className={`font-bold text-sm ${isPos?'text-emerald-600':isNeg?'text-red-600':'text-slate-600'}`}>
+          {isPos?'+':isNeg?'-':''}{fmt(ev.monto)}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════
+   TAB: DASHBOARD
+═══════════════════════════════════════════════ */
+function Dashboard({state,setSaldoInicial}){
+  const {saldoInicial,ingresos,gastos,tdc,gastosRec=[]}=state;
+  const today=todayStr();
+
+  const now=useMemo(()=>computeState(today,saldoInicial,ingresos,gastos,tdc,gastosRec),[today,saldoInicial,ingresos,gastos,tdc,gastosRec]);
+  const m30=useMemo(()=>computeState(addDays(today,30),saldoInicial,ingresos,gastos,tdc,gastosRec),[today,saldoInicial,ingresos,gastos,tdc,gastosRec]);
+
+  // Next cut-off
+  const d=new Date(); const dc=parseInt(tdc.diaCorte)||15;
+  let nextCutoff=new Date(d.getFullYear(),d.getMonth(),dc);
+  if(nextCutoff<d) nextCutoff=new Date(d.getFullYear(),d.getMonth()+1,dc);
+  const nextCutoffS=dateStr(nextCutoff);
+  const diasCorte=Math.ceil((nextCutoff-d)/(86400000));
+
+  const incomeBeforeCutoff=useMemo(()=>{
+    const evts=getEvents(today,nextCutoffS,ingresos,[],tdc,gastosRec);
+    return Object.values(evts).flat().filter(e=>e.tipo==='ingreso').reduce((s,e)=>s+e.monto,0);
+  },[today,nextCutoffS,ingresos,tdc,gastosRec]);
+
+  const next7evts=useMemo(()=>{
+    const evts=getEvents(today,addDays(today,7),ingresos,gastos,tdc,gastosRec);
+    return Object.entries(evts)
+      .flatMap(([ds,arr])=>arr.map(e=>({...e,fecha:ds})))
+      .sort((a,b)=>a.fecha.localeCompare(b.fecha));
+  },[today,ingresos,gastos,tdc,gastosRec]);
+
+  const creditoDisp=(parseFloat(tdc.limite)||0)-(parseFloat(tdc.saldo)||0);
+  const canPay=now.free+incomeBeforeCutoff>=parseFloat(tdc.saldo)||0;
+
+  return(
+    <div className="space-y-4">
+      {/* Saldo */}
+      <Card>
+        <SectionHeader title="Mi Efectivo" icon="💵" color="blue"/>
+        <div className="p-4 space-y-3">
+          <div>
+            <label className="text-xs text-slate-400 uppercase tracking-wide font-semibold">Saldo actual (editable)</label>
+            <div className="flex items-center gap-2 mt-1 bg-blue-50 border-2 border-blue-200 rounded-xl px-3 py-2">
+              <span className="text-blue-400 font-bold">$</span>
+              <input type="number" value={saldoInicial}
+                onChange={e=>setSaldoInicial(parseFloat(e.target.value)||0)}
+                className="flex-1 text-2xl font-bold text-blue-700 bg-transparent outline-none"/>
+              <span className="text-xs text-blue-400">MXN</span>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3 pt-1">
+            <StatBox label="Efectivo hoy" value={fmt(now.cash)} color={now.cash>=0?'green':'red'}/>
+            <StatBox label="⚠️ Comprometido (impuestos)" value={fmt(now.committed)} color="orange"/>
+          </div>
+          <div className="bg-gradient-to-r from-blue-600 to-blue-700 rounded-xl p-4 text-white text-center">
+            <p className="text-xs text-white/70 uppercase tracking-wide">Efectivo LIBRE (sin comprometer)</p>
+            <p className={`text-3xl font-bold mt-1`}>{fmt(now.free)}</p>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <StatBox label="Libre en 30 días" value={fmt(m30.free)} color={m30.free>=0?'green':'red'}/>
+            <StatBox label="Comprometido en 30d" value={fmt(m30.committed)} color="orange"/>
+          </div>
+        </div>
+      </Card>
+
+      {/* TDC */}
+      <Card>
+        <SectionHeader title="Tarjeta de Crédito" icon="💳" color="purple"/>
+        <div className="p-4">
+          <div className="grid grid-cols-3 gap-3 mb-3">
+            <StatBox label="Saldo TDC" value={fmt(tdc.saldo)} color="red"/>
+            <StatBox label="Disponible" value={fmt(creditoDisp)} color="green"/>
+            <StatBox label="Días al corte" value={diasCorte} sub={`día ${dc} c/mes`} color="purple"/>
+          </div>
+          <div className={`p-3 rounded-xl border text-sm font-semibold ${canPay?'bg-emerald-50 border-emerald-200 text-emerald-700':'bg-amber-50 border-amber-200 text-amber-700'}`}>
+            {canPay
+              ?`✅ Con tus ingresos antes del corte (${fmt(incomeBeforeCutoff)}) puedes cubrir el saldo TDC (${fmt(tdc.saldo)}).`
+              :`⚠️ Recibirás ${fmt(incomeBeforeCutoff)} antes del corte pero debes ${fmt(tdc.saldo)}. Revisa la pestaña TDC para el análisis completo.`}
+          </div>
+        </div>
+      </Card>
+
+      {/* Próximos 7 días */}
+      <Card>
+        <SectionHeader title="Próximos 7 días" icon="📅" color="slate"/>
+        <div className="p-4">
+          {next7evts.length===0
+            ?<p className="text-slate-400 text-center py-6 text-sm">Sin eventos programados</p>
+            :<div className="space-y-2">
+              {next7evts.map((e,i)=>(
+                <div key={i} className="flex items-start gap-2">
+                  <span className="text-xs text-slate-400 mt-1 w-16 shrink-0">{fmtDate(e.fecha).split(' ').slice(0,2).join(' ')}</span>
+                  <div className="flex-1"><EventRow ev={e}/></div>
+                </div>
+              ))}
+            </div>
+          }
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════
+   TAB: INGRESOS
+═══════════════════════════════════════════════ */
+function IngresosTab({ingresos,setIngresos}){
+  const blank={nombre:'',montoBruto:'',frecuencia:'Semanal',diaCobro:5};
+  const [form,setForm]=useState(blank);
+  const [editId,setEditId]=useState(null);
+
+  const taxes=form.montoBruto?calcTaxes(parseFloat(form.montoBruto)||0):null;
+  const needsDia=form.frecuencia==='Semanal'||form.frecuencia==='Mensual';
+
+  function save(){
+    if(!form.nombre.trim()||!(parseFloat(form.montoBruto)>0))return;
+    const rec={...form,montoBruto:parseFloat(form.montoBruto),
+      diaCobro:needsDia?parseInt(form.diaCobro):null,
+      id:editId||uid()};
+    setIngresos(editId?ingresos.map(i=>i.id===editId?rec:i):[...ingresos,rec]);
+    setForm(blank); setEditId(null);
+  }
+
+  function edit(ing){setForm({...ing,montoBruto:String(ing.montoBruto)});setEditId(ing.id);}
+  function del(id){setIngresos(ingresos.filter(i=>i.id!==id));}
+
+  const diasSem=[{v:1,l:'Lunes'},{v:2,l:'Martes'},{v:3,l:'Miércoles'},{v:4,l:'Jueves'},{v:5,l:'Viernes'},{v:6,l:'Sábado'},{v:7,l:'Domingo'}];
+
+  return(
+    <div className="space-y-4">
+      <Card>
+        <SectionHeader title={editId?'Editar ingreso':'Nueva fuente de ingreso'} icon="💰" color="green"/>
+        <div className="p-4 space-y-3">
+          <div>
+            <label className="text-xs text-slate-500 font-semibold">Nombre / descripción</label>
+            <input value={form.nombre} onChange={e=>setForm({...form,nombre:e.target.value})}
+              className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-blue-400 outline-none text-sm"
+              placeholder="ej. Pago semanal cliente A"/>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-slate-500 font-semibold">Monto bruto ($)</label>
+              <input type="number" value={form.montoBruto} onChange={e=>setForm({...form,montoBruto:e.target.value})}
+                className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-blue-400 outline-none text-sm"
+                placeholder="5000"/>
+            </div>
+            <div>
+              <label className="text-xs text-slate-500 font-semibold">Frecuencia</label>
+              <select value={form.frecuencia} onChange={e=>setForm({...form,frecuencia:e.target.value,diaCobro:e.target.value==='Semanal'?5:1})}
+                className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-blue-400 outline-none text-sm bg-white">
+                <option>Semanal</option><option>Quincenal</option>
+                <option>Mensual</option><option>Fin de Mes</option>
+              </select>
+            </div>
+          </div>
+          {form.frecuencia==='Semanal'&&(
+            <div>
+              <label className="text-xs text-slate-500 font-semibold">Día de cobro</label>
+              <select value={form.diaCobro} onChange={e=>setForm({...form,diaCobro:parseInt(e.target.value)})}
+                className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-blue-400 outline-none text-sm bg-white">
+                {diasSem.map(d=><option key={d.v} value={d.v}>{d.l}</option>)}
+              </select>
+            </div>
+          )}
+          {form.frecuencia==='Mensual'&&(
+            <div>
+              <label className="text-xs text-slate-500 font-semibold">Día del mes (1–28)</label>
+              <input type="number" min="1" max="28" value={form.diaCobro}
+                onChange={e=>setForm({...form,diaCobro:parseInt(e.target.value)})}
+                className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-blue-400 outline-none text-sm"/>
+            </div>
+          )}
+
+          {taxes&&parseFloat(form.montoBruto)>0&&(
+            <div className="bg-amber-50 border border-amber-200 rounded-xl p-3">
+              <p className="text-xs font-bold text-amber-700 mb-2">Desglose por cobro:</p>
+              <div className="grid grid-cols-4 gap-2 text-center text-xs">
+                <div><p className="text-slate-400">Bruto</p><p className="font-bold text-slate-700">{fmt(parseFloat(form.montoBruto))}</p></div>
+                <div><p className="text-slate-400">IVA 16%</p><p className="font-bold text-orange-500">{fmt(taxes.iva)}</p></div>
+                <div><p className="text-slate-400">ISR 1%</p><p className="font-bold text-orange-500">{fmt(taxes.isr)}</p></div>
+                <div><p className="text-slate-400">Neto</p><p className="font-bold text-emerald-600">{fmt(parseFloat(form.montoBruto)-taxes.total)}</p></div>
+              </div>
+              <p className="text-xs text-amber-600 mt-2">⚠️ Los impuestos ({fmt(taxes.total)}) se agendan como pago el 1ro del mes siguiente.</p>
+            </div>
+          )}
+
+          <div className="flex gap-2">
+            <button onClick={save} className="flex-1 py-2.5 bg-emerald-600 text-white rounded-xl font-bold text-sm hover:bg-emerald-700">
+              {editId?'Guardar cambios':'+ Agregar ingreso'}
+            </button>
+            {editId&&<button onClick={()=>{setForm(blank);setEditId(null);}}
+              className="px-4 py-2.5 bg-slate-100 text-slate-600 rounded-xl font-bold text-sm hover:bg-slate-200">
+              Cancelar
+            </button>}
+          </div>
+        </div>
+      </Card>
+
+      <Card>
+        <SectionHeader title="Mis fuentes de ingreso" icon="📋" color="slate"/>
+        <div className="p-4 space-y-3">
+          {ingresos.length===0&&<p className="text-slate-400 text-center py-6 text-sm">Sin fuentes configuradas</p>}
+          {ingresos.map(ing=>{
+            const t=calcTaxes(ing.montoBruto);
+            const frecLabel=ing.frecuencia==='Semanal'?`${ing.frecuencia} · ${diasSem.find(d=>d.v===ing.diaCobro)?.l||''}`:
+              ing.frecuencia==='Mensual'?`${ing.frecuencia} · día ${ing.diaCobro}`:ing.frecuencia;
+            return(
+              <div key={ing.id} className="border-2 border-slate-100 rounded-xl p-3 hover:border-slate-200 transition-colors">
+                <div className="flex justify-between items-start">
+                  <div>
+                    <p className="font-bold text-slate-800">{ing.nombre}</p>
+                    <p className="text-xs text-slate-400 mt-0.5">{frecLabel}</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="font-bold text-emerald-600">{fmt(ing.montoBruto)}</p>
+                    <p className="text-xs text-orange-400">imp: {fmt(t.total)}</p>
+                  </div>
+                </div>
+                <div className="flex gap-2 mt-2">
+                  <button onClick={()=>edit(ing)} className="text-xs px-3 py-1 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 font-semibold">Editar</button>
+                  <button onClick={()=>del(ing.id)} className="text-xs px-3 py-1 bg-red-50 text-red-500 rounded-lg hover:bg-red-100 font-semibold">Eliminar</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════
+   TAB: GASTOS
+═══════════════════════════════════════════════ */
+function GastosTab({gastos,setGastos,gastosRec,setGastosRec,tdc,ingresos}){
+  // ── Gasto puntual ──
+  const [form,setForm]=useState({fecha:todayStr(),descripcion:'',monto:'',tipoPago:'efectivo'});
+  function addGasto(){
+    if(!form.descripcion.trim()||!(parseFloat(form.monto)>0))return;
+    setGastos([...gastos,{...form,monto:parseFloat(form.monto),id:uid()}]);
+    setForm(f=>({...f,descripcion:'',monto:''}));
+  }
+
+  // ── Gastos recurrentes ──
+  const blankRec={nombre:'',monto:'',frecuencia:'Mensual',diaCobro:1,fechaEspecifica:todayStr(),tipoPago:'efectivo'};
+  const [recForm,setRecForm]=useState(blankRec);
+  const [recEditId,setRecEditId]=useState(null);
+  const [showRecForm,setShowRecForm]=useState(false);
+
+  function saveRec(){
+    if(!recForm.nombre.trim()||!(parseFloat(recForm.monto)>0))return;
+    const rec={...recForm,monto:parseFloat(recForm.monto),
+      diaCobro:recForm.frecuencia==='Semanal'||recForm.frecuencia==='Mensual'?parseInt(recForm.diaCobro):null,
+      id:recEditId||uid()};
+    setGastosRec(recEditId?gastosRec.map(r=>r.id===recEditId?rec:r):[...gastosRec,rec]);
+    setRecForm(blankRec); setRecEditId(null); setShowRecForm(false);
+  }
+  function editRec(r){setRecForm({...r,monto:String(r.monto)});setRecEditId(r.id);setShowRecForm(true);}
+  function delRec(id){setGastosRec(gastosRec.filter(r=>r.id!==id));}
+
+  const diasSem=[{v:1,l:'Lunes'},{v:2,l:'Martes'},{v:3,l:'Miércoles'},{v:4,l:'Jueves'},{v:5,l:'Viernes'},{v:6,l:'Sábado'},{v:7,l:'Domingo'}];
+  const frecLabel=(r)=>{
+    if(r.frecuencia==='Semanal')return `Semanal · ${diasSem.find(d=>d.v===r.diaCobro)?.l||''}`;
+    if(r.frecuencia==='Mensual')return `Mensual · día ${r.diaCobro}`;
+    if(r.frecuencia==='Fecha específica')return `Una vez · ${fmtDate(r.fechaEspecifica)}`;
+    return r.frecuencia;
+  };
+
+  // ── Historial por mes ──
+  const now=new Date();
+  const [hYear,setHYear]=useState(now.getFullYear());
+  const [hMonth,setHMonth]=useState(now.getMonth());
+
+  const monthStartS=`${hYear}-${String(hMonth+1).padStart(2,'0')}-01`;
+  const monthEndS=dateStr(new Date(hYear,hMonth+1,0));
+
+  // Get all expense-type events for this month (excludes income)
+  const EXPENSE_TIPOS=['gasto_efectivo','gasto_tdc','gasto_rec_efectivo','gasto_rec_tarjeta','pago_tdc'];
+  const historialEvts=useMemo(()=>{
+    const evts=getEvents(monthStartS,monthEndS,ingresos,gastos,tdc,gastosRec);
+    return Object.entries(evts)
+      .flatMap(([ds,arr])=>arr
+        .filter(e=>EXPENSE_TIPOS.includes(e.tipo))
+        .map(e=>({...e,fecha:ds})))
+      .sort((a,b)=>b.fecha.localeCompare(a.fecha));
+  },[monthStartS,monthEndS,ingresos,gastos,tdc,gastosRec]);
+
+  const totalMes=historialEvts.reduce((s,e)=>s+(e.monto||0),0);
+
+  const prevHMonth=()=>{if(hMonth===0){setHYear(y=>y-1);setHMonth(11);}else setHMonth(m=>m-1);};
+  const nextHMonth=()=>{if(hMonth===11){setHYear(y=>y+1);setHMonth(0);}else setHMonth(m=>m+1);};
+
+  return(
+    <div className="space-y-4">
+      {/* ── Gasto puntual ── */}
+      <Card>
+        <SectionHeader title="Registrar gasto" icon="💸" color="red" sub="Un gasto específico en una fecha"/>
+        <div className="p-4 space-y-3">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-slate-500 font-semibold">Fecha</label>
+              <input type="date" value={form.fecha} onChange={e=>setForm({...form,fecha:e.target.value})}
+                className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-blue-400 outline-none text-sm"/>
+            </div>
+            <div>
+              <label className="text-xs text-slate-500 font-semibold">Monto ($)</label>
+              <input type="number" value={form.monto} onChange={e=>setForm({...form,monto:e.target.value})}
+                className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-blue-400 outline-none text-sm" placeholder="0.00"/>
+            </div>
+          </div>
+          <div>
+            <label className="text-xs text-slate-500 font-semibold">Descripción</label>
+            <input value={form.descripcion} onChange={e=>setForm({...form,descripcion:e.target.value})}
+              onKeyDown={e=>e.key==='Enter'&&addGasto()}
+              className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-blue-400 outline-none text-sm"
+              placeholder="ej. Supermercado, Gasolina..."/>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <button onClick={()=>setForm({...form,tipoPago:'efectivo'})}
+              className={`py-3 rounded-xl font-bold text-sm border-2 transition-all ${form.tipoPago==='efectivo'?'bg-blue-600 text-white border-blue-600':'bg-white text-slate-500 border-slate-200 hover:border-blue-200'}`}>
+              💵 Efectivo
+            </button>
+            <button onClick={()=>setForm({...form,tipoPago:'tarjeta'})}
+              className={`py-3 rounded-xl font-bold text-sm border-2 transition-all ${form.tipoPago==='tarjeta'?'bg-purple-600 text-white border-purple-600':'bg-white text-slate-500 border-slate-200 hover:border-purple-200'}`}>
+              💳 Tarjeta
+            </button>
+          </div>
+          <button onClick={addGasto} className="w-full py-3 bg-red-500 text-white rounded-xl font-bold hover:bg-red-600">
+            Registrar gasto
+          </button>
+        </div>
+      </Card>
+
+      {/* ── Gastos recurrentes ── */}
+      <Card>
+        <SectionHeader title="Gastos recurrentes" icon="🔄" color="slate" sub="Retiros, servicios, suscripciones..."/>
+        <div className="p-4 space-y-3">
+          <button onClick={()=>{setShowRecForm(!showRecForm);setRecForm(blankRec);setRecEditId(null);}}
+            className="w-full py-2.5 bg-sky-600 text-white rounded-xl font-bold text-sm hover:bg-sky-700">
+            {showRecForm?'✕ Cancelar':'+ Agregar gasto recurrente'}
+          </button>
+
+          {showRecForm&&(
+            <div className="bg-sky-50 border border-sky-200 rounded-xl p-4 space-y-3">
+              <h3 className="font-bold text-sky-800 text-sm">{recEditId?'Editar recurrente':'Nuevo gasto recurrente'}</h3>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="col-span-2">
+                  <label className="text-xs text-slate-500 font-semibold">Nombre / descripción</label>
+                  <input value={recForm.nombre} onChange={e=>setRecForm({...recForm,nombre:e.target.value})}
+                    className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-sky-400 outline-none text-sm"
+                    placeholder="ej. Netflix, Gym, Renta, Retiro semanal..."/>
+                </div>
+                <div>
+                  <label className="text-xs text-slate-500 font-semibold">Monto ($)</label>
+                  <input type="number" value={recForm.monto} onChange={e=>setRecForm({...recForm,monto:e.target.value})}
+                    className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-sky-400 outline-none text-sm" placeholder="0.00"/>
+                </div>
+                <div>
+                  <label className="text-xs text-slate-500 font-semibold">Frecuencia</label>
+                  <select value={recForm.frecuencia} onChange={e=>setRecForm({...recForm,frecuencia:e.target.value,diaCobro:1})}
+                    className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-sky-400 outline-none text-sm bg-white">
+                    <option>Semanal</option><option>Quincenal</option>
+                    <option>Mensual</option><option>Fin de Mes</option>
+                    <option>Fecha específica</option>
+                  </select>
+                </div>
+                {recForm.frecuencia==='Semanal'&&(
+                  <div className="col-span-2">
+                    <label className="text-xs text-slate-500 font-semibold">Día de la semana</label>
+                    <select value={recForm.diaCobro} onChange={e=>setRecForm({...recForm,diaCobro:parseInt(e.target.value)})}
+                      className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-sky-400 outline-none text-sm bg-white">
+                      {diasSem.map(d=><option key={d.v} value={d.v}>{d.l}</option>)}
+                    </select>
+                  </div>
+                )}
+                {recForm.frecuencia==='Mensual'&&(
+                  <div className="col-span-2">
+                    <label className="text-xs text-slate-500 font-semibold">Día del mes (1–28)</label>
+                    <input type="number" min="1" max="28" value={recForm.diaCobro}
+                      onChange={e=>setRecForm({...recForm,diaCobro:parseInt(e.target.value)})}
+                      className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-sky-400 outline-none text-sm"/>
+                  </div>
+                )}
+                {recForm.frecuencia==='Fecha específica'&&(
+                  <div className="col-span-2">
+                    <label className="text-xs text-slate-500 font-semibold">Fecha (una sola vez)</label>
+                    <input type="date" value={recForm.fechaEspecifica}
+                      onChange={e=>setRecForm({...recForm,fechaEspecifica:e.target.value})}
+                      className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-sky-400 outline-none text-sm"/>
+                  </div>
+                )}
+                <div className="col-span-2">
+                  <label className="text-xs text-slate-500 font-semibold block mb-2">Forma de pago</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button onClick={()=>setRecForm({...recForm,tipoPago:'efectivo'})}
+                      className={`py-2.5 rounded-xl font-bold text-sm border-2 transition-all ${recForm.tipoPago==='efectivo'?'bg-blue-600 text-white border-blue-600':'bg-white text-slate-500 border-slate-200'}`}>
+                      💵 Efectivo
+                    </button>
+                    <button onClick={()=>setRecForm({...recForm,tipoPago:'tarjeta'})}
+                      className={`py-2.5 rounded-xl font-bold text-sm border-2 transition-all ${recForm.tipoPago==='tarjeta'?'bg-purple-600 text-white border-purple-600':'bg-white text-slate-500 border-slate-200'}`}>
+                      💳 Tarjeta
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <button onClick={saveRec}
+                className="w-full py-2.5 bg-sky-600 text-white rounded-xl font-bold text-sm hover:bg-sky-700">
+                {recEditId?'Guardar cambios':'Agregar gasto recurrente'}
+              </button>
+            </div>
+          )}
+
+          {gastosRec.length===0&&!showRecForm&&(
+            <p className="text-slate-400 text-center py-4 text-sm">Sin gastos recurrentes configurados</p>
+          )}
+          {gastosRec.map(r=>(
+            <div key={r.id} className="border-2 border-sky-100 rounded-xl p-3 bg-sky-50 flex items-center gap-3">
+              <span className="text-xl">🔄</span>
+              <div className="flex-1 min-w-0">
+                <p className="font-bold text-sky-800 text-sm truncate">{r.nombre}</p>
+                <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                  <span className="text-xs bg-sky-200 text-sky-700 px-1.5 py-0.5 rounded-md font-semibold">{frecLabel(r)}</span>
+                  <span className={`text-xs px-1.5 py-0.5 rounded-md font-semibold ${r.tipoPago==='tarjeta'?'bg-purple-100 text-purple-600':'bg-blue-100 text-blue-600'}`}>
+                    {r.tipoPago==='tarjeta'?'💳 Tarjeta':'💵 Efectivo'}
+                  </span>
+                </div>
+              </div>
+              <span className="font-bold text-sky-700">{fmt(r.monto)}</span>
+              <div className="flex gap-1">
+                <button onClick={()=>editRec(r)} className="px-2 py-1 bg-blue-100 text-blue-600 rounded-lg text-xs font-bold hover:bg-blue-200">✏️</button>
+                <button onClick={()=>delRec(r.id)} className="px-2 py-1 bg-red-100 text-red-500 rounded-lg text-xs font-bold hover:bg-red-200">🗑️</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      {/* ── Historial por mes ── */}
+      <Card>
+        <SectionHeader title="Historial por mes" icon="📋" color="slate"/>
+        <div className="p-4">
+          {/* Month nav */}
+          <div className="flex items-center justify-between mb-3">
+            <button onClick={prevHMonth} className="p-2 hover:bg-slate-100 rounded-xl font-bold text-slate-600">‹</button>
+            <div className="text-center">
+              <p className="font-bold text-slate-800">{MESES[hMonth]} {hYear}</p>
+              <p className="text-xs text-red-500 font-semibold">Total: {fmt(totalMes)}</p>
+            </div>
+            <button onClick={nextHMonth} className="p-2 hover:bg-slate-100 rounded-xl font-bold text-slate-600">›</button>
+          </div>
+
+          {/* Leyenda */}
+          <div className="flex flex-wrap gap-2 mb-3 text-xs">
+            {[['bg-blue-100 text-blue-700','💵 Efectivo'],
+              ['bg-purple-100 text-purple-700','💳 Gasto TDC'],
+              ['bg-sky-100 text-sky-700','🔄 Recurrente'],
+              ['bg-rose-100 text-rose-700','💳 Pago TDC']].map(([c,l])=>(
+              <span key={l} className={`px-2 py-0.5 rounded-full font-semibold ${c}`}>{l}</span>
+            ))}
+          </div>
+
+          <div className="space-y-2">
+            {historialEvts.length===0&&<p className="text-slate-400 text-center py-6 text-sm">Sin movimientos este mes</p>}
+            {historialEvts.map((e,i)=>{
+              const isManual=e.tipo==='gasto_efectivo'||e.tipo==='gasto_tdc';
+              const bgMap={
+                gasto_efectivo:'bg-blue-50 border-l-blue-500 border border-blue-100',
+                gasto_tdc:'bg-purple-50 border-l-purple-500 border border-purple-100',
+                gasto_rec_efectivo:'bg-sky-50 border-l-sky-500 border border-sky-100',
+                gasto_rec_tarjeta:'bg-violet-50 border-l-violet-500 border border-violet-100',
+                pago_tdc:'bg-rose-50 border-l-rose-500 border border-rose-100',
+              };
+              const iconMap={gasto_efectivo:'💵',gasto_tdc:'💳',gasto_rec_efectivo:'🔄',gasto_rec_tarjeta:'🔄',pago_tdc:'💳'};
+              const txtMap={gasto_efectivo:'text-blue-800',gasto_tdc:'text-purple-800',
+                gasto_rec_efectivo:'text-sky-800',gasto_rec_tarjeta:'text-violet-800',pago_tdc:'text-rose-800'};
+              return(
+                <div key={e.id||i} className={`flex items-center gap-3 p-3 rounded-xl border-l-4 ${bgMap[e.tipo]||'bg-slate-50 border border-slate-100'}`}>
+                  <span className="text-lg">{iconMap[e.tipo]||'📌'}</span>
+                  <div className="flex-1 min-w-0">
+                    <p className={`font-semibold text-sm truncate ${txtMap[e.tipo]||'text-slate-700'}`}>{e.label}</p>
+                    <div className="flex items-center gap-2 mt-0.5">
+                      <span className="text-xs text-slate-400">{fmtDate(e.fecha)}</span>
+                      {e.recurrente&&<span className="text-xs text-sky-500 font-semibold">🔄 recurrente</span>}
+                      {e.tipo==='pago_tdc'&&<span className="text-xs text-rose-500 font-semibold">automático</span>}
+                    </div>
+                  </div>
+                  <span className="font-bold text-red-600 text-sm">{fmt(e.monto)}</span>
+                  {isManual&&(
+                    <button onClick={()=>setGastos(gastos.filter(x=>x.id!==e.id))}
+                      className="ml-1 px-2 py-1 bg-red-100 hover:bg-red-200 text-red-500 rounded-lg text-xs font-bold">🗑️</button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════
+   TAB: CALENDARIO
+═══════════════════════════════════════════════ */
+function CalendarioTab({state}){
+  const {saldoInicial,ingresos,gastos,tdc,gastosRec=[]}=state;
+  const now=new Date();
+  const [year,setYear]=useState(now.getFullYear());
+  const [month,setMonth]=useState(now.getMonth());
+  const [selDay,setSelDay]=useState(null);
+
+  const firstDay=new Date(year,month,1);
+  const daysInMonth=new Date(year,month+1,0).getDate();
+  // Start week on Monday
+  let startDow=firstDay.getDay()-1;
+  if(startDow<0)startDow=6;
+
+  const monthStartS=`${year}-${String(month+1).padStart(2,'0')}-01`;
+  const monthEndS=`${year}-${String(month+1).padStart(2,'0')}-${String(daysInMonth).padStart(2,'0')}`;
+
+  const evts=useMemo(()=>getEvents(monthStartS,monthEndS,ingresos,gastos,tdc,gastosRec),[monthStartS,monthEndS,ingresos,gastos,tdc,gastosRec]);
+
+  // Compute daily balances for the whole month in one pass (efficient)
+  const balances=useMemo(()=>{
+    const res={};
+    for(let d=1;d<=daysInMonth;d++){
+      const ds=`${year}-${String(month+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      res[ds]=computeState(ds,saldoInicial,ingresos,gastos,tdc,gastosRec);
+    }
+    return res;
+  },[year,month,daysInMonth,saldoInicial,ingresos,gastos,tdc,gastosRec]);
+
+  const todayS=todayStr();
+  const prev=()=>{if(month===0){setYear(y=>y-1);setMonth(11);}else setMonth(m=>m-1);setSelDay(null);};
+  const next=()=>{if(month===11){setYear(y=>y+1);setMonth(0);}else setMonth(m=>m+1);setSelDay(null);};
+
+  const dotColor={ingreso:'bg-emerald-500',gasto_efectivo:'bg-red-400',gasto_tdc:'bg-purple-400',
+                  impuestos:'bg-orange-400',pago_tdc:'bg-violet-500'};
+
+  const selDs=selDay?`${year}-${String(month+1).padStart(2,'0')}-${String(selDay).padStart(2,'0')}`:null;
+  const selEvts=selDs?(evts[selDs]||[]):[];
+  const selBal=selDs?balances[selDs]:null;
+
+  return(
+    <div className="space-y-4">
+      <Card>
+        <div className="p-4">
+          {/* Nav */}
+          <div className="flex items-center justify-between mb-4">
+            <button onClick={prev} className="p-2 hover:bg-slate-100 rounded-xl text-slate-600 font-bold">‹</button>
+            <h2 className="text-lg font-bold text-slate-800">{MESES[month]} {year}</h2>
+            <button onClick={next} className="p-2 hover:bg-slate-100 rounded-xl text-slate-600 font-bold">›</button>
+          </div>
+
+          {/* Day headers */}
+          <div className="grid grid-cols-7 mb-1">
+            {['Lun','Mar','Mié','Jue','Vie','Sáb','Dom'].map(d=>(
+              <div key={d} className="text-center text-xs font-bold text-slate-400 py-1">{d}</div>
+            ))}
+          </div>
+
+          {/* Grid */}
+          <div className="grid grid-cols-7 gap-1">
+            {Array.from({length:startDow}).map((_,i)=><div key={`e${i}`}/>)}
+            {Array.from({length:daysInMonth}).map((_,i)=>{
+              const day=i+1;
+              const ds=`${year}-${String(month+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+              const isToday=ds===todayS;
+              const isSel=day===selDay;
+              const isWknd=new Date(ds+'T12:00:00').getDay()===0||new Date(ds+'T12:00:00').getDay()===6;
+              const dayEvts=evts[ds]||[];
+              const bal=balances[ds];
+              return(
+                <div key={day} onClick={()=>setSelDay(day===selDay?null:day)}
+                  className={`rounded-xl p-1 cursor-pointer min-h-[56px] transition-all border
+                    ${isSel?'border-blue-400 bg-blue-50 shadow-md':'border-transparent'}
+                    ${isToday&&!isSel?'bg-blue-100 border-blue-200':''}
+                    ${isWknd&&!isSel&&!isToday?'bg-slate-50':''}
+                    ${!isSel&&!isToday&&!isWknd?'hover:bg-slate-50':''}`}>
+                  <div className={`text-xs font-bold ${isToday?'text-blue-600':isWknd?'text-slate-400':'text-slate-700'}`}>{day}</div>
+                  <div className="flex flex-wrap gap-0.5 mt-0.5">
+                    {dayEvts.slice(0,4).map((e,ei)=>(
+                      <div key={ei} className={`w-1.5 h-1.5 rounded-full ${dotColor[e.tipo]||'bg-slate-400'}`}/>
+                    ))}
+                    {dayEvts.length>4&&<div className="w-1.5 h-1.5 rounded-full bg-slate-300"/>}
+                  </div>
+                  {bal&&(
+                    <div className={`text-xs font-semibold mt-0.5 leading-tight ${bal.free>=0?'text-emerald-600':'text-red-600'}`}>
+                      {fmtShort(bal.free)}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Legend */}
+          <div className="flex flex-wrap gap-3 mt-4 pt-3 border-t border-slate-100 text-xs text-slate-400">
+            {[['bg-emerald-500','Ingreso'],['bg-red-400','Gasto efect.'],['bg-purple-400','Gasto TDC'],
+              ['bg-orange-400','Impuestos'],['bg-violet-500','Pago TDC']].map(([c,l])=>(
+              <div key={l} className="flex items-center gap-1"><div className={`w-2.5 h-2.5 rounded-full ${c}`}/>{l}</div>
+            ))}
+            <div className="flex items-center gap-1"><div className="w-2.5 h-2.5 rounded bg-blue-100 border border-blue-200"/><span>Hoy</span></div>
+          </div>
+        </div>
+      </Card>
+
+      {/* Day detail */}
+      {selDay&&(
+        <Card>
+          <SectionHeader title={`${selDay} de ${MESES[month]} ${year}`} icon="📌" color="blue"/>
+          <div className="p-4 space-y-2">
+            {selEvts.length===0&&<p className="text-slate-400 text-center py-4 text-sm">Sin eventos este día</p>}
+            {selEvts.map((e,i)=><EventRow key={i} ev={e}/>)}
+            {selBal&&(
+              <div className="grid grid-cols-3 gap-2 mt-3 pt-3 border-t border-slate-100">
+                <StatBox label="Efectivo total" value={fmt(selBal.cash)} color={selBal.cash>=0?'green':'red'}/>
+                <StatBox label="Comprometido" value={fmt(selBal.committed)} color="orange"/>
+                <StatBox label="Libre" value={fmt(selBal.free)} color={selBal.free>=0?'blue':'red'}/>
+              </div>
+            )}
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════
+   TAB: TDC
+═══════════════════════════════════════════════ */
+function TDCTab({state,setTDC}){
+  const {saldoInicial,ingresos,gastos,tdc,gastosRec=[]}=state;
+  const [form,setForm]=useState({...tdc});
+  const [compra,setCompra]=useState('');
+
+  function save(){
+    setTDC({saldo:parseFloat(form.saldo)||0,limite:parseFloat(form.limite)||0,
+      diaCorte:parseInt(form.diaCorte)||15,diasGracia:parseInt(form.diasGracia)||20});
+  }
+
+  const today=todayStr();
+  const d=new Date(); const dc=parseInt(tdc.diaCorte)||15;
+  let nextCutoff=new Date(d.getFullYear(),d.getMonth(),dc);
+  if(nextCutoff<d) nextCutoff=new Date(d.getFullYear(),d.getMonth()+1,dc);
+  const nextCutoffS=dateStr(nextCutoff);
+  const diasCorte=Math.ceil((nextCutoff-d)/(86400000));
+
+  const payDate=new Date(nextCutoff);
+  payDate.setDate(payDate.getDate()+(parseInt(tdc.diasGracia)||20));
+  const payDateS=dateStr(payDate);
+
+  const incomeBeforeCutoff=useMemo(()=>{
+    const evts=getEvents(today,nextCutoffS,ingresos,[],tdc,gastosRec);
+    return Object.values(evts).flat().filter(e=>e.tipo==='ingreso').reduce((s,e)=>s+e.monto,0);
+  },[today,nextCutoffS,ingresos,tdc,gastosRec]);
+
+  const nowState=useMemo(()=>computeState(today,saldoInicial,ingresos,gastos,tdc,gastosRec),[today,saldoInicial,ingresos,gastos,tdc,gastosRec]);
+  const compraN=parseFloat(compra)||0;
+  const totalTDC=(parseFloat(tdc.saldo)||0)+compraN;
+  const disponible=nowState.free+incomeBeforeCutoff;
+  const diff=disponible-totalTDC;
+  const puedePagar=diff>=0;
+  const creditoDisp=(parseFloat(tdc.limite)||0)-(parseFloat(tdc.saldo)||0);
+  const cabeEnTDC=compraN<=creditoDisp;
+
+  return(
+    <div className="space-y-4">
+      <Card>
+        <SectionHeader title="Configuración de tarjeta" icon="💳" color="purple"/>
+        <div className="p-4 space-y-3">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-slate-500 font-semibold">Saldo actual ($)</label>
+              <input type="number" value={form.saldo} onChange={e=>setForm({...form,saldo:e.target.value})}
+                className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-purple-400 outline-none text-sm"/>
+            </div>
+            <div>
+              <label className="text-xs text-slate-500 font-semibold">Límite de crédito ($)</label>
+              <input type="number" value={form.limite} onChange={e=>setForm({...form,limite:e.target.value})}
+                className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-purple-400 outline-none text-sm"/>
+            </div>
+            <div>
+              <label className="text-xs text-slate-500 font-semibold">Día de corte (1–28)</label>
+              <input type="number" min="1" max="28" value={form.diaCorte} onChange={e=>setForm({...form,diaCorte:e.target.value})}
+                className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-purple-400 outline-none text-sm"/>
+            </div>
+            <div>
+              <label className="text-xs text-slate-500 font-semibold">Días de gracia</label>
+              <input type="number" min="1" max="30" value={form.diasGracia} onChange={e=>setForm({...form,diasGracia:e.target.value})}
+                className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-purple-400 outline-none text-sm"/>
+            </div>
+          </div>
+          <button onClick={save} className="w-full py-2.5 bg-purple-600 text-white rounded-xl font-bold text-sm hover:bg-purple-700">Guardar configuración</button>
+
+          <div className="grid grid-cols-3 gap-3 pt-1">
+            <StatBox label="Saldo TDC" value={fmt(tdc.saldo)} color="red"/>
+            <StatBox label="Disponible" value={fmt(creditoDisp)} color="green"/>
+            <StatBox label="Días al corte" value={diasCorte} color="purple"/>
+          </div>
+          <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs text-slate-500 space-y-1">
+            <p>📅 Próximo corte: <strong>{fmtDate(nextCutoffS)}</strong></p>
+            <p>💳 Fecha límite de pago: <strong>{fmtDate(payDateS)}</strong></p>
+            <p>🏛️ El pago de la TDC y los impuestos se muestran automáticamente en el Calendario.</p>
+          </div>
+        </div>
+      </Card>
+
+      <Card>
+        <SectionHeader title="¿Puedo pagar esta compra con TDC?" icon="🔍" color="slate"
+          sub="Analiza si puedes liquidar la tarjeta antes del corte"/>
+        <div className="p-4 space-y-3">
+          <div>
+            <label className="text-xs text-slate-500 font-semibold">Monto de la compra a analizar ($)</label>
+            <input type="number" value={compra} onChange={e=>setCompra(e.target.value)}
+              className="w-full border-2 border-blue-200 rounded-xl px-3 py-3 mt-1 focus:border-blue-400 outline-none text-xl font-bold text-blue-700"
+              placeholder="0.00"/>
+          </div>
+
+          {compraN>0&&!cabeEnTDC&&(
+            <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-sm text-red-700 font-semibold">
+              ❌ La compra de {fmt(compraN)} supera tu crédito disponible de {fmt(creditoDisp)}.
+            </div>
+          )}
+
+          {(compraN>0||true)&&(
+            <div className="space-y-2">
+              <div className="flex justify-between items-center p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-sm text-slate-600">Saldo TDC actual</span>
+                <span className="font-bold text-red-600">{fmt(tdc.saldo)}</span>
+              </div>
+              {compraN>0&&<div className="flex justify-between items-center p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-sm text-slate-600">+ Compra a realizar</span>
+                <span className="font-bold text-red-500">+{fmt(compraN)}</span>
+              </div>}
+              <div className="flex justify-between items-center p-3 bg-red-50 rounded-xl border border-red-200">
+                <span className="text-sm font-bold text-red-700">= Total a pagar TDC</span>
+                <span className="font-bold text-red-700">{fmt(totalTDC)}</span>
+              </div>
+              <div className="border-t border-dashed border-slate-200 my-1"/>
+              <div className="flex justify-between items-center p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-sm text-slate-600">Tu efectivo libre hoy</span>
+                <span className="font-bold text-blue-600">{fmt(nowState.free)}</span>
+              </div>
+              <div className="flex justify-between items-center p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-sm text-slate-600">+ Ingresos antes del corte ({fmtDate(nextCutoffS)})</span>
+                <span className="font-bold text-emerald-600">+{fmt(incomeBeforeCutoff)}</span>
+              </div>
+              <div className="flex justify-between items-center p-3 bg-emerald-50 rounded-xl border border-emerald-200">
+                <span className="text-sm font-bold text-emerald-700">= Disponible para pagar</span>
+                <span className="font-bold text-emerald-700">{fmt(disponible)}</span>
+              </div>
+
+              <div className={`p-4 rounded-2xl border-2 ${puedePagar&&cabeEnTDC?'bg-emerald-50 border-emerald-300':'bg-red-50 border-red-300'}`}>
+                <p className={`font-bold text-base ${puedePagar&&cabeEnTDC?'text-emerald-700':'text-red-700'}`}>
+                  {puedePagar&&cabeEnTDC
+                    ?`✅ SÍ puedes — después de pagar la TDC te sobrarán ${fmt(diff)}.`
+                    :!cabeEnTDC
+                    ?`❌ NO cabe en tu crédito disponible (${fmt(creditoDisp)}).`
+                    :`❌ NO alcanza — te faltan ${fmt(-diff)} para cubrir la TDC.`}
+                </p>
+                {puedePagar&&compraN>0&&cabeEnTDC&&(
+                  <p className="text-xs text-emerald-600 mt-1">
+                    Recuerda pagar antes del {fmtDate(payDateS)} para no generar intereses.
+                  </p>
+                )}
+                {!puedePagar&&compraN>0&&cabeEnTDC&&(
+                  <p className="text-xs text-red-600 mt-1">
+                    Puedes hacer una compra de máximo {fmt(Math.max(0,disponible-parseFloat(tdc.saldo)))} sin riesgo.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════
+   TAB: PROYECCIÓN
+═══════════════════════════════════════════════ */
+function ProyeccionTab({state}){
+  const {saldoInicial,ingresos,gastos,tdc,gastosRec=[]}=state;
+  const defaultTarget=useMemo(()=>{
+    const d=new Date(); d.setMonth(d.getMonth()+3); return dateStr(d);
+  },[]);
+  const [target,setTarget]=useState(defaultTarget);
+  const today=todayStr();
+
+  const proj=useMemo(()=>{
+    if(!target||target<=today)return null;
+    return computeState(target,saldoInicial,ingresos,gastos,tdc,gastosRec);
+  },[target,saldoInicial,ingresos,gastos,tdc,gastosRec,today]);
+
+  const daysUntil=target?Math.ceil((new Date(target)-new Date())/(86400000)):0;
+
+  const timeline=useMemo(()=>{
+    if(!target)return[];
+    const evts=getEvents(today,target,ingresos,gastos,tdc,gastosRec);
+    return Object.entries(evts)
+      .flatMap(([ds,arr])=>arr.map(e=>({...e,fecha:ds})))
+      .sort((a,b)=>a.fecha.localeCompare(b.fecha))
+      .slice(0,30);
+  },[target,ingresos,gastos,tdc,gastosRec,today]);
+
+  // Monthly income summary
+  const monthSummary=useMemo(()=>{
+    if(!target)return[];
+    const evts=getEvents(today,target,ingresos,[],tdc,gastosRec);
+    const byMonth={};
+    Object.entries(evts).forEach(([ds,arr])=>{
+      const mk=ds.substr(0,7);
+      if(!byMonth[mk])byMonth[mk]={ingresos:0,impuestos:0,pagos:0};
+      arr.forEach(e=>{
+        if(e.tipo==='ingreso'){byMonth[mk].ingresos+=e.monto;byMonth[mk].impuestos+=e.impuestos?.total||0;}
+        if(e.tipo==='impuestos')byMonth[mk].pagos+=e.monto;
+      });
+    });
+    return Object.entries(byMonth).map(([mk,v])=>({mk,...v})).slice(0,6);
+  },[target,ingresos,tdc,today]);
+
+  return(
+    <div className="space-y-4">
+      <Card>
+        <SectionHeader title="Proyección a fecha futura" icon="🔮" color="blue"
+          sub="¿Cuánto tendré en un día específico?"/>
+        <div className="p-4 space-y-3">
+          <div>
+            <label className="text-xs text-slate-500 font-semibold">Fecha objetivo</label>
+            <input type="date" value={target} min={addDays(today,1)} onChange={e=>setTarget(e.target.value)}
+              className="w-full border-2 border-blue-200 rounded-xl px-3 py-3 mt-1 focus:border-blue-400 outline-none text-lg font-bold text-blue-700"/>
+          </div>
+
+          {proj&&(
+            <div>
+              <p className="text-sm text-slate-400 text-center mb-3">En <strong className="text-slate-700">{daysUntil} días</strong> ({fmtDate(target)}):</p>
+              <div className="bg-gradient-to-r from-blue-600 to-indigo-700 rounded-2xl p-5 text-white text-center mb-3">
+                <p className="text-white/70 text-xs uppercase tracking-wide mb-1">Efectivo libre proyectado</p>
+                <p className={`text-4xl font-bold`}>{fmt(proj.free)}</p>
+                <p className="text-white/60 text-xs mt-2">Total en cuenta: {fmt(proj.cash)} · Comprometido: {fmt(proj.committed)}</p>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <StatBox label="Efectivo total" value={fmt(proj.cash)} color={proj.cash>=0?'green':'red'}/>
+                <StatBox label="Saldo TDC proyectado" value={fmt(proj.tdcBal)} color={proj.tdcBal>0?'red':'green'}/>
+              </div>
+            </div>
+          )}
+
+          {target<=today&&<p className="text-sm text-amber-600 bg-amber-50 p-3 rounded-xl border border-amber-200">⚠️ Selecciona una fecha futura para ver la proyección.</p>}
+        </div>
+      </Card>
+
+      {monthSummary.length>0&&(
+        <Card>
+          <SectionHeader title="Resumen mensual (ingresos)" icon="📊" color="green"/>
+          <div className="p-4 space-y-2">
+            {monthSummary.map(({mk,ingresos:ing,impuestos:imp,pagos})=>{
+              const [y,m]=mk.split('-');
+              return(
+                <div key={mk} className="border border-slate-100 rounded-xl p-3">
+                  <div className="flex justify-between items-center mb-2">
+                    <p className="font-bold text-sm text-slate-700">{MESES[parseInt(m)-1]} {y}</p>
+                    <p className="font-bold text-emerald-600">{fmt(ing)}</p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div className="bg-orange-50 rounded-lg p-2">
+                      <p className="text-orange-400">Impuestos generados</p>
+                      <p className="font-bold text-orange-600">{fmt(imp)}</p>
+                    </div>
+                    <div className="bg-emerald-50 rounded-lg p-2">
+                      <p className="text-emerald-400">Neto libre</p>
+                      <p className="font-bold text-emerald-600">{fmt(ing-imp)}</p>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+
+      {timeline.length>0&&(
+        <Card>
+          <SectionHeader title="Próximos eventos (hasta la fecha)" icon="📋" color="slate"/>
+          <div className="p-4 space-y-2">
+            {timeline.map((e,i)=>(
+              <div key={i} className="flex gap-2 items-start">
+                <div className="text-xs text-slate-400 mt-1 w-20 shrink-0">{fmtDate(e.fecha)}</div>
+                <div className="flex-1"><EventRow ev={e}/></div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════
+   APP ROOT
+═══════════════════════════════════════════════ */
+const SK='finanzas_v3';
+const DEFAULT={
+  saldoInicial:2500,
+  ingresos:[
+    {id:'i1',nombre:'Pago semanal',montoBruto:5000,frecuencia:'Semanal',diaCobro:5},
+    {id:'i2',nombre:'Pago fin de mes',montoBruto:8000,frecuencia:'Fin de Mes',diaCobro:null},
+  ],
+  gastos:[],
+  gastosRec:[],
+  tdc:{saldo:3500,limite:20000,diaCorte:15,diasGracia:20},
+};
+
+const TABS=[
+  {id:'dashboard',icon:'📊',label:'Dashboard'},
+  {id:'ingresos', icon:'💰',label:'Ingresos'},
+  {id:'gastos',   icon:'💸',label:'Gastos'},
+  {id:'calendario',icon:'📅',label:'Calendario'},
+  {id:'tdc',      icon:'💳',label:'TDC'},
+  {id:'proyeccion',icon:'🔮',label:'Proyección'},
+];
+
+function App(){
+  const [tab,setTab]=useState('dashboard');
+  const [state,setState]=useState(()=>{
+    try{const s=localStorage.getItem(SK);return s?JSON.parse(s):DEFAULT;}catch{return DEFAULT;}
+  });
+
+  useEffect(()=>{try{localStorage.setItem(SK,JSON.stringify(state));}catch{}},[state]);
+
+  const set=k=>v=>setState(s=>({...s,[k]:v}));
+
+  return(
+    <div className="min-h-screen bg-slate-100">
+      {/* Header */}
+      <div className="bg-gradient-to-r from-slate-800 to-slate-900 shadow-xl">
+        <div className="max-w-2xl mx-auto px-4 py-4 flex items-center justify-between">
+          <div>
+            <h1 className="text-white text-xl font-bold">💼 Finanzas Personales</h1>
+            <p className="text-slate-400 text-xs mt-0.5">
+              {new Date().toLocaleDateString('es-MX',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}
+            </p>
+          </div>
+          <button
+            onClick={()=>{if(confirm('¿Borrar todos los datos y empezar de cero?'))setState(DEFAULT);}}
+            className="text-slate-500 hover:text-red-400 text-xs px-2 py-1 rounded-lg hover:bg-slate-700 transition-colors">
+            Reiniciar
+          </button>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div className="bg-white border-b border-slate-200 sticky top-0 z-20 shadow-sm">
+        <div className="max-w-2xl mx-auto flex overflow-x-auto">
+          {TABS.map(t=>(
+            <button key={t.id} onClick={()=>setTab(t.id)}
+              className={`flex-shrink-0 flex items-center gap-1.5 px-3 py-3 text-xs font-bold border-b-2 transition-all whitespace-nowrap
+                ${tab===t.id?'border-blue-600 text-blue-600 bg-blue-50':'border-transparent text-slate-500 hover:text-slate-700 hover:bg-slate-50'}`}>
+              <span className="text-base">{t.icon}</span>
+              <span className="hidden sm:inline">{t.label}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Content */}
+      <div className="max-w-2xl mx-auto px-4 py-5">
+        {tab==='dashboard'   &&<Dashboard   state={state} setSaldoInicial={set('saldoInicial')}/>}
+        {tab==='ingresos'    &&<IngresosTab ingresos={state.ingresos} setIngresos={set('ingresos')}/>}
+        {tab==='gastos'      &&<GastosTab   gastos={state.gastos} setGastos={set('gastos')}
+                                           gastosRec={state.gastosRec||[]} setGastosRec={set('gastosRec')}
+                                           tdc={state.tdc} ingresos={state.ingresos}/>}
+        {tab==='calendario'  &&<CalendarioTab state={state}/>}
+        {tab==='tdc'         &&<TDCTab      state={state} setTDC={set('tdc')}/>}
+        {tab==='proyeccion'  &&<ProyeccionTab state={state}/>}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
