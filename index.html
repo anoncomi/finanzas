@@ -70,18 +70,18 @@ function dayOfWeekMon(dateS){
   return dow===0?7:dow;
 }
 
-function calcTaxes(bruto){
-  const iva=bruto*0.16;
-  const isr=(bruto/1.16)*0.01;
-  return {iva,isr,total:iva+isr};
+function calcTaxes(bruto, ivaRate=16, isrRate=1){
+  const base=bruto/(1+ivaRate/100); // base sin IVA
+  const iva=base*(ivaRate/100);
+  const isr=base*(isrRate/100);
+  return {iva,isr,total:iva+isr,base};
 }
 
-// Returns taxes for an ingreso, using custom values if set (allows 0)
+// Returns taxes for an ingreso, using stored rates (default 16% IVA, 1% ISR)
 function getIngTaxes(ing){
-  const auto=calcTaxes(ing.montoBruto);
-  const iva=ing.ivaCustom!=null?parseFloat(ing.ivaCustom):auto.iva;
-  const isr=ing.isrCustom!=null?parseFloat(ing.isrCustom):auto.isr;
-  return {iva,isr,total:iva+isr};
+  const ivaRate=ing.ivaRate??16;
+  const isrRate=ing.isrRate??1;
+  return calcTaxes(ing.montoBruto,ivaRate,isrRate);
 }
 
 function shouldPayOn(ing,dateS){
@@ -91,8 +91,27 @@ function shouldPayOn(ing,dateS){
   const lastDom=new Date(d.getFullYear(),d.getMonth()+1,0).getDate();
   switch(ing.frecuencia){
     case'Semanal':   return dow===ing.diaCobro;
-    case'Quincenal': return dom===1||dom===15;
+    case'Quincenal': {
+      if(ing.fechaInicioQuincenal){
+        const start=new Date(ing.fechaInicioQuincenal+'T12:00:00');
+        const cur=new Date(dateS+'T12:00:00');
+        if(cur<start)return false;
+        const diff=Math.round((cur-start)/86400000);
+        return diff%15===0;
+      }
+      return dom===1||dom===15;
+    }
+    case'Catorcenal': {
+      if(!ing.fechaInicioCatorcenal)return false;
+      if(dow!==ing.diaCobro)return false;
+      const start=new Date(ing.fechaInicioCatorcenal+'T12:00:00');
+      const cur=new Date(dateS+'T12:00:00');
+      if(cur<start)return false;
+      const diff=Math.round((cur-start)/86400000);
+      return diff%14===0;
+    }
     case'Mensual':   return dom===Math.min(ing.diaCobro,lastDom);
+    case'Anual':     return (d.getMonth()+1)===(ing.mesAnual||1)&&dom===Math.min(ing.diaAnual||1,lastDom);
     case'Fin de Mes':return dom===lastDom;
     case'Único':     return dateS===ing.fechaUnica;
     default:         return false;
@@ -124,6 +143,20 @@ function computeState(targetS, saldoInicial, ingresos, gastos, tdc, gastosRec=[]
   const taxByMonth={}; // 'YYYY-MM' -> accumulated taxes (received but not yet paid)
   const paidTaxMonths=new Set();
   const paidTDCDates=new Set();
+
+  // Pre-populate taxes from days 1..(today-1) of the current month.
+  // saldoInicial already reflects those gross incomes, so we only track
+  // the tax liability — do NOT add to cash.
+  const monthStart=new Date(today.getFullYear(),today.getMonth(),1);
+  for(let pre=new Date(monthStart);pre<today;pre.setDate(pre.getDate()+1)){
+    const preS=dateStr(new Date(pre));
+    const preMk=preS.substr(0,7);
+    for(const ing of ingresos){
+      if(shouldPayOn(ing,preS)){
+        taxByMonth[preMk]=(taxByMonth[preMk]||0)+getIngTaxes(ing).total;
+      }
+    }
+  }
 
   for(let d=new Date(today);d<=target;d.setDate(d.getDate()+1)){
     const ds=dateStr(new Date(d));
@@ -164,9 +197,20 @@ function computeState(targetS, saldoInicial, ingresos, gastos, tdc, gastosRec=[]
 
     // ── Gastos del día (puntuales) ──
     for(const g of gastos){
-      if(g.fecha===ds){
-        if(g.tipoPago==='efectivo') cash-=g.monto;
-        else tdcBal+=g.monto;
+      const meses=g.meses&&g.meses>1?g.meses:1;
+      if(g.tipoPago==='efectivo'){
+        if(g.fecha===ds) cash-=g.monto;
+      } else {
+        if(g.fecha===ds){
+          tdcBal+=g.monto/meses;
+        } else if(meses>1){
+          const gd=new Date(g.fecha+'T12:00:00');
+          for(let m=1;m<meses;m++){
+            const inst=new Date(gd);
+            inst.setMonth(inst.getMonth()+m);
+            if(dateStr(inst)===ds){tdcBal+=g.monto/meses;break;}
+          }
+        }
       }
     }
 
@@ -217,7 +261,7 @@ function getEvents(startS,endS,ingresos,gastos,tdc,gastosRec=[]){
       for(let pd2=new Date(pStart);pd2<=pEnd;pd2.setDate(pd2.getDate()+1)){
         const ds2=dateStr(new Date(pd2));
         for(const ing of ingresos){
-          if(shouldPayOn(ing,ds2)) taxTotal+=calcTaxes(ing.montoBruto).total;
+          if(shouldPayOn(ing,ds2)) taxTotal+=getIngTaxes(ing).total;
         }
       }
       if(taxTotal>0){
@@ -227,18 +271,8 @@ function getEvents(startS,endS,ingresos,gastos,tdc,gastosRec=[]){
       }
     }
 
-    // Pago TDC auto
-    if(tdc.diaCorte&&tdc.diasGracia){
-      for(let mo=-1;mo<=2;mo++){
-        const checkD=new Date(d.getFullYear(),d.getMonth()+mo,parseInt(tdc.diaCorte));
-        const pd=tdcPayDate(parseInt(tdc.diaCorte),parseInt(tdc.diasGracia),checkD.getFullYear(),checkD.getMonth());
-        if(pd===ds){
-          push(ds,{tipo:'pago_tdc',id:'tdcpay-'+ds,
-            label:`Pago TDC (corte día ${tdc.diaCorte})`,monto:parseFloat(tdc.saldo)||0,auto:true});
-          break;
-        }
-      }
-    }
+    // Pago TDC — calculado por ciclo, se inserta abajo del loop
+
 
     // Gastos recurrentes
     for(const gr of gastosRec){
@@ -251,9 +285,96 @@ function getEvents(startS,endS,ingresos,gastos,tdc,gastosRec=[]){
 
   // Gastos manuales
   for(const g of gastos){
-    if(g.fecha>=startS&&g.fecha<=endS){
-      push(g.fecha,{tipo:g.tipoPago==='tarjeta'?'gasto_tdc':'gasto_efectivo',
-        id:g.id,label:g.descripcion,monto:g.monto,tipoPago:g.tipoPago});
+    const meses=g.meses&&g.meses>1?g.meses:1;
+    const cuota=g.monto/meses;
+    if(g.tipoPago==='efectivo'){
+      if(g.fecha>=startS&&g.fecha<=endS)
+        push(g.fecha,{tipo:'gasto_efectivo',id:g.id,label:g.descripcion,monto:g.monto,tipoPago:g.tipoPago});
+    } else {
+      if(g.fecha>=startS&&g.fecha<=endS){
+        const lbl=meses>1?`${g.descripcion} (cuota 1/${meses})`:g.descripcion;
+        push(g.fecha,{tipo:'gasto_tdc',id:g.id,label:lbl,monto:cuota,tipoPago:g.tipoPago});
+      }
+      if(meses>1){
+        const gd=new Date(g.fecha+'T12:00:00');
+        for(let m=1;m<meses;m++){
+          const inst=new Date(gd);
+          inst.setMonth(inst.getMonth()+m);
+          const instS=dateStr(inst);
+          if(instS>=startS&&instS<=endS)
+            push(instS,{tipo:'gasto_tdc',id:g.id+'-m'+m,label:`${g.descripcion} (cuota ${m+1}/${meses})`,monto:cuota,tipoPago:g.tipoPago});
+        }
+      }
+    }
+  }
+
+  // ── Pagos TDC por ciclo de corte ──
+  // El saldo inicial del usuario se agenda UNA sola vez (en el siguiente pago).
+  // Los gastos con tarjeta se acumulan dentro de su ciclo y se pagan en la fecha correspondiente.
+  if(tdc.diaCorte&&tdc.diasGracia){
+    const diaCorte=parseInt(tdc.diaCorte);
+    const diasGracia=parseInt(tdc.diasGracia);
+    const today=new Date(); today.setHours(0,0,0,0);
+    const todayS=dateStr(today);
+
+    // Construir lista de fechas de corte: desde 2 meses antes del inicio hasta 1 mes después del fin
+    const scanStart=new Date(startS+'T12:00:00'); scanStart.setMonth(scanStart.getMonth()-2);
+    const scanEnd=new Date(endS+'T12:00:00');     scanEnd.setMonth(scanEnd.getMonth()+1);
+    const cutoffs=[];
+    let cy=scanStart.getFullYear(), cm=scanStart.getMonth();
+    while(true){
+      const co=new Date(cy,cm,diaCorte);
+      cutoffs.push(co);
+      cm++; if(cm>11){cm=0;cy++;}
+      if(co>scanEnd) break;
+    }
+
+    const addedPayDates=new Set();
+    for(let i=1;i<cutoffs.length;i++){
+      const prevCut=cutoffs[i-1];
+      const thisCut=cutoffs[i];
+      const payD=tdcPayDate(diaCorte,diasGracia,thisCut.getFullYear(),thisCut.getMonth());
+      if(payD<startS||payD>endS||addedPayDates.has(payD)) continue;
+
+      const prevCutS=dateStr(prevCut);
+      const thisCutS=dateStr(thisCut);
+
+      let amount=0;
+
+      // Saldo inicial: solo en el ciclo donde today cae entre prevCut y thisCut (inclusive en thisCut)
+      if(prevCut<today&&today<=thisCut){
+        amount+=parseFloat(tdc.saldo)||0;
+      }
+
+      // Gastos manuales con tarjeta dentro del ciclo (después del corte anterior, hasta este corte)
+      for(const g of gastos){
+        if(g.tipoPago!=='tarjeta') continue;
+        const meses=g.meses&&g.meses>1?g.meses:1;
+        const cuota=g.monto/meses;
+        const gd=new Date(g.fecha+'T12:00:00');
+        for(let m=0;m<meses;m++){
+          const inst=new Date(gd);
+          inst.setMonth(inst.getMonth()+m);
+          const instS=dateStr(inst);
+          if(instS>prevCutS&&instS<=thisCutS) amount+=cuota;
+        }
+      }
+
+      // Gastos recurrentes con tarjeta dentro del ciclo
+      for(let d=new Date(prevCut.getTime()+86400000);d<=thisCut;d.setDate(d.getDate()+1)){
+        const ds2=dateStr(new Date(d));
+        for(const gr of gastosRec){
+          if(gr.tipoPago==='tarjeta'&&shouldExpenseOn(gr,ds2)){
+            amount+=gr.monto;
+          }
+        }
+      }
+
+      if(amount>0){
+        addedPayDates.add(payD);
+        push(payD,{tipo:'pago_tdc',id:'tdcpay-'+payD,
+          label:`Pago TDC (corte día ${diaCorte})`,monto:amount,auto:true});
+      }
     }
   }
 
@@ -439,16 +560,15 @@ function Dashboard({state,setSaldoInicial}){
    TAB: INGRESOS
 ═══════════════════════════════════════════════ */
 function IngresosTab({ingresos,setIngresos}){
-  const blank={nombre:'',montoBruto:'',frecuencia:'Semanal',diaCobro:5,fechaUnica:'',ivaCustom:null,isrCustom:null};
+  const blank={nombre:'',montoBruto:'',frecuencia:'Semanal',diaCobro:5,fechaUnica:'',ivaRate:16,isrRate:1,fechaInicioQuincenal:todayStr(),fechaInicioCatorcenal:todayStr()};
   const [form,setForm]=useState(blank);
   const [editId,setEditId]=useState(null);
 
   const monto=parseFloat(form.montoBruto)||0;
-  const autoTaxes=monto>0?calcTaxes(monto):null;
-  const effIva=form.ivaCustom!=null?parseFloat(form.ivaCustom)||0:(autoTaxes?.iva||0);
-  const effIsr=form.isrCustom!=null?parseFloat(form.isrCustom)||0:(autoTaxes?.isr||0);
-  const effTotal=effIva+effIsr;
-  const needsDia=form.frecuencia==='Semanal'||form.frecuencia==='Mensual';
+  const ivaRate=parseFloat(form.ivaRate)||0;
+  const isrRate=parseFloat(form.isrRate)||0;
+  const effTaxes=monto>0?calcTaxes(monto,ivaRate,isrRate):null;
+  const needsDia=form.frecuencia==='Semanal'||form.frecuencia==='Mensual'||form.frecuencia==='Catorcenal';
 
   function save(){
     if(!form.nombre.trim()||!(monto>0))return;
@@ -456,14 +576,16 @@ function IngresosTab({ingresos,setIngresos}){
     const rec={...form,montoBruto:monto,
       diaCobro:needsDia?parseInt(form.diaCobro):null,
       fechaUnica:form.frecuencia==='Único'?form.fechaUnica:null,
-      ivaCustom:form.ivaCustom!=null?parseFloat(form.ivaCustom):null,
-      isrCustom:form.isrCustom!=null?parseFloat(form.isrCustom):null,
+      fechaInicioQuincenal:form.frecuencia==='Quincenal'?form.fechaInicioQuincenal||null:null,
+      fechaInicioCatorcenal:form.frecuencia==='Catorcenal'?form.fechaInicioCatorcenal||null:null,
+      ivaRate:parseFloat(form.ivaRate)||0,
+      isrRate:parseFloat(form.isrRate)||0,
       id:editId||uid()};
     setIngresos(editId?ingresos.map(i=>i.id===editId?rec:i):[...ingresos,rec]);
     setForm(blank); setEditId(null);
   }
 
-  function edit(ing){setForm({...ing,montoBruto:String(ing.montoBruto),ivaCustom:ing.ivaCustom??null,isrCustom:ing.isrCustom??null,fechaUnica:ing.fechaUnica||''});setEditId(ing.id);}
+  function edit(ing){setForm({...ing,montoBruto:String(ing.montoBruto),ivaRate:ing.ivaRate??16,isrRate:ing.isrRate??1,fechaUnica:ing.fechaUnica||'',fechaInicioQuincenal:ing.fechaInicioQuincenal||todayStr(),fechaInicioCatorcenal:ing.fechaInicioCatorcenal||todayStr()});setEditId(ing.id);}
   function del(id){setIngresos(ingresos.filter(i=>i.id!==id));}
 
   const diasSem=[{v:1,l:'Lunes'},{v:2,l:'Martes'},{v:3,l:'Miércoles'},{v:4,l:'Jueves'},{v:5,l:'Viernes'},{v:6,l:'Sábado'},{v:7,l:'Domingo'}];
@@ -488,10 +610,10 @@ function IngresosTab({ingresos,setIngresos}){
             </div>
             <div>
               <label className="text-xs text-slate-500 font-semibold">Frecuencia</label>
-              <select value={form.frecuencia} onChange={e=>setForm({...form,frecuencia:e.target.value,diaCobro:e.target.value==='Semanal'?5:1})}
+              <select value={form.frecuencia} onChange={e=>setForm({...form,frecuencia:e.target.value,diaCobro:e.target.value==='Semanal'||e.target.value==='Catorcenal'?5:1})}
                 className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-blue-400 outline-none text-sm bg-white">
                 <option>Semanal</option><option>Quincenal</option>
-                <option>Mensual</option><option>Único</option>
+                <option>Catorcenal</option><option>Mensual</option><option>Único</option>
               </select>
             </div>
           </div>
@@ -502,6 +624,31 @@ function IngresosTab({ingresos,setIngresos}){
                 className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-blue-400 outline-none text-sm bg-white">
                 {diasSem.map(d=><option key={d.v} value={d.v}>{d.l}</option>)}
               </select>
+            </div>
+          )}
+          {form.frecuencia==='Quincenal'&&(
+            <div>
+              <label className="text-xs text-slate-500 font-semibold">Fecha del primer cobro</label>
+              <input type="date" value={form.fechaInicioQuincenal} onChange={e=>setForm({...form,fechaInicioQuincenal:e.target.value})}
+                className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-blue-400 outline-none text-sm"/>
+              <p className="text-xs text-slate-400 mt-1">A partir de esta fecha se cobrará cada 15 días.</p>
+            </div>
+          )}
+          {form.frecuencia==='Catorcenal'&&(
+            <div className="space-y-2">
+              <div>
+                <label className="text-xs text-slate-500 font-semibold">Día de cobro</label>
+                <select value={form.diaCobro} onChange={e=>setForm({...form,diaCobro:parseInt(e.target.value)})}
+                  className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-blue-400 outline-none text-sm bg-white">
+                  {diasSem.map(d=><option key={d.v} value={d.v}>{d.l}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-slate-500 font-semibold">Fecha del primer cobro</label>
+                <input type="date" value={form.fechaInicioCatorcenal} onChange={e=>setForm({...form,fechaInicioCatorcenal:e.target.value})}
+                  className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-blue-400 outline-none text-sm"/>
+                <p className="text-xs text-slate-400 mt-1">A partir de esta fecha se cobrará cada 14 días.</p>
+              </div>
             </div>
           )}
           {form.frecuencia==='Mensual'&&(
@@ -520,32 +667,42 @@ function IngresosTab({ingresos,setIngresos}){
             </div>
           )}
 
-          {monto>0&&autoTaxes&&(
+          {monto>0&&effTaxes&&(
             <div className="bg-amber-50 border border-amber-200 rounded-xl p-3">
-              <p className="text-xs font-bold text-amber-700 mb-2">Desglose por cobro <span className="font-normal text-amber-600">(puedes editar IVA e ISR)</span>:</p>
-              <div className="grid grid-cols-4 gap-2 text-center text-xs">
-                <div><p className="text-slate-400">Bruto</p><p className="font-bold text-slate-700">{fmt(monto)}</p></div>
+              <p className="text-xs font-bold text-amber-700 mb-1">Impuestos <span className="font-normal text-amber-600">(edita el % si ya te los retienen)</span></p>
+              <div className="grid grid-cols-2 gap-2 mb-2">
                 <div>
-                  <p className="text-slate-400">IVA 16%</p>
-                  <input type="number" min="0"
-                    value={form.ivaCustom!=null?form.ivaCustom:autoTaxes.iva.toFixed(2)}
-                    onChange={e=>setForm({...form,ivaCustom:e.target.value})}
-                    className="w-full border border-orange-300 rounded-lg px-1 py-0.5 text-center text-orange-500 font-bold bg-white focus:outline-none focus:border-orange-500 text-xs mt-1"/>
+                  <label className="text-xs text-slate-500">IVA %</label>
+                  <div className="flex items-center gap-1 mt-0.5">
+                    <input type="number" min="0" max="100" step="0.1"
+                      value={form.ivaRate}
+                      onChange={e=>setForm({...form,ivaRate:e.target.value})}
+                      className="w-full border border-orange-300 rounded-lg px-2 py-1 text-orange-600 font-bold bg-white focus:outline-none focus:border-orange-500 text-xs"/>
+                    <span className="text-orange-400 text-xs font-bold">%</span>
+                  </div>
                 </div>
                 <div>
-                  <p className="text-slate-400">ISR 1%</p>
-                  <input type="number" min="0"
-                    value={form.isrCustom!=null?form.isrCustom:autoTaxes.isr.toFixed(2)}
-                    onChange={e=>setForm({...form,isrCustom:e.target.value})}
-                    className="w-full border border-orange-300 rounded-lg px-1 py-0.5 text-center text-orange-500 font-bold bg-white focus:outline-none focus:border-orange-500 text-xs mt-1"/>
+                  <label className="text-xs text-slate-500">ISR %</label>
+                  <div className="flex items-center gap-1 mt-0.5">
+                    <input type="number" min="0" max="100" step="0.1"
+                      value={form.isrRate}
+                      onChange={e=>setForm({...form,isrRate:e.target.value})}
+                      className="w-full border border-orange-300 rounded-lg px-2 py-1 text-orange-600 font-bold bg-white focus:outline-none focus:border-orange-500 text-xs"/>
+                    <span className="text-orange-400 text-xs font-bold">%</span>
+                  </div>
                 </div>
-                <div><p className="text-slate-400">Neto</p><p className="font-bold text-emerald-600">{fmt(monto-effTotal)}</p></div>
               </div>
-              {(form.ivaCustom!=null||form.isrCustom!=null)&&(
-                <button onClick={()=>setForm({...form,ivaCustom:null,isrCustom:null})}
-                  className="text-xs text-amber-600 underline mt-1">↺ Restablecer automático</button>
+              <div className="grid grid-cols-4 gap-2 text-center text-xs bg-amber-100 rounded-lg p-2">
+                <div><p className="text-slate-400">Bruto</p><p className="font-bold text-slate-700">{fmt(monto)}</p></div>
+                <div><p className="text-slate-400">IVA</p><p className="font-bold text-orange-500">{fmt(effTaxes.iva)}</p></div>
+                <div><p className="text-slate-400">ISR</p><p className="font-bold text-orange-500">{fmt(effTaxes.isr)}</p></div>
+                <div><p className="text-slate-400">Neto</p><p className="font-bold text-emerald-600">{fmt(monto-effTaxes.total)}</p></div>
+              </div>
+              {(ivaRate!==16||isrRate!==1)&&(
+                <button onClick={()=>setForm({...form,ivaRate:16,isrRate:1})}
+                  className="text-xs text-amber-600 underline mt-1">↺ Restablecer (16% / 1%)</button>
               )}
-              <p className="text-xs text-amber-600 mt-2">⚠️ Los impuestos ({fmt(effTotal)}) se agendan como pago el 1ro del mes siguiente.</p>
+              <p className="text-xs text-amber-600 mt-2">⚠️ Los impuestos ({fmt(effTaxes.total)}) se agendan como pago el 1ro del mes siguiente.</p>
             </div>
           )}
 
@@ -567,9 +724,12 @@ function IngresosTab({ingresos,setIngresos}){
           {ingresos.length===0&&<p className="text-slate-400 text-center py-6 text-sm">Sin fuentes configuradas</p>}
           {ingresos.map(ing=>{
             const t=getIngTaxes(ing);
-            const frecLabel=ing.frecuencia==='Semanal'?`${ing.frecuencia} · ${diasSem.find(d=>d.v===ing.diaCobro)?.l||''}`:
-              ing.frecuencia==='Mensual'?`${ing.frecuencia} · día ${ing.diaCobro}`:
-              ing.frecuencia==='Único'?`${ing.frecuencia} · ${ing.fechaUnica||''}`:ing.frecuencia;
+            const frecLabel=
+              ing.frecuencia==='Semanal'?`Semanal · ${diasSem.find(d=>d.v===ing.diaCobro)?.l||''}`:
+              ing.frecuencia==='Quincenal'?`Quincenal · desde ${fmtDate(ing.fechaInicioQuincenal)||'cada 1 y 15'}`:
+              ing.frecuencia==='Catorcenal'?`Catorcenal · ${diasSem.find(d=>d.v===ing.diaCobro)?.l||''} c/14 días`:
+              ing.frecuencia==='Mensual'?`Mensual · día ${ing.diaCobro}`:
+              ing.frecuencia==='Único'?`Único · ${fmtDate(ing.fechaUnica)||''}`:ing.frecuencia;
             return(
               <div key={ing.id} className="border-2 border-slate-100 rounded-xl p-3 hover:border-slate-200 transition-colors">
                 <div className="flex justify-between items-start">
@@ -600,34 +760,42 @@ function IngresosTab({ingresos,setIngresos}){
 ═══════════════════════════════════════════════ */
 function GastosTab({gastos,setGastos,gastosRec,setGastosRec,tdc,ingresos}){
   // ── Gasto puntual ──
-  const [form,setForm]=useState({fecha:todayStr(),descripcion:'',monto:'',tipoPago:'efectivo'});
+  const [form,setForm]=useState({fecha:todayStr(),descripcion:'',monto:'',tipoPago:'efectivo',meses:1});
   function addGasto(){
     if(!form.descripcion.trim()||!(parseFloat(form.monto)>0))return;
-    setGastos([...gastos,{...form,monto:parseFloat(form.monto),id:uid()}]);
-    setForm(f=>({...f,descripcion:'',monto:''}));
+    setGastos([...gastos,{...form,monto:parseFloat(form.monto),meses:form.tipoPago==='tarjeta'?parseInt(form.meses)||1:1,id:uid()}]);
+    setForm(f=>({...f,descripcion:'',monto:'',meses:1}));
   }
 
   // ── Gastos recurrentes ──
-  const blankRec={nombre:'',monto:'',frecuencia:'Mensual',diaCobro:1,fechaEspecifica:todayStr(),tipoPago:'efectivo'};
+  const blankRec={nombre:'',monto:'',frecuencia:'Mensual',diaCobro:1,fechaEspecifica:todayStr(),tipoPago:'efectivo',mesAnual:1,diaAnual:1,fechaInicioQuincenal:todayStr(),fechaInicioCatorcenal:todayStr()};
   const [recForm,setRecForm]=useState(blankRec);
   const [recEditId,setRecEditId]=useState(null);
   const [showRecForm,setShowRecForm]=useState(false);
 
   function saveRec(){
     if(!recForm.nombre.trim()||!(parseFloat(recForm.monto)>0))return;
+    const needsDiaCobro=recForm.frecuencia==='Semanal'||recForm.frecuencia==='Mensual'||recForm.frecuencia==='Catorcenal';
     const rec={...recForm,monto:parseFloat(recForm.monto),
-      diaCobro:recForm.frecuencia==='Semanal'||recForm.frecuencia==='Mensual'?parseInt(recForm.diaCobro):null,
+      diaCobro:needsDiaCobro?parseInt(recForm.diaCobro):null,
+      mesAnual:recForm.frecuencia==='Anual'?parseInt(recForm.mesAnual)||1:null,
+      diaAnual:recForm.frecuencia==='Anual'?parseInt(recForm.diaAnual)||1:null,
+      fechaInicioQuincenal:recForm.frecuencia==='Quincenal'?recForm.fechaInicioQuincenal:null,
+      fechaInicioCatorcenal:recForm.frecuencia==='Catorcenal'?recForm.fechaInicioCatorcenal:null,
       id:recEditId||uid()};
     setGastosRec(recEditId?gastosRec.map(r=>r.id===recEditId?rec:r):[...gastosRec,rec]);
     setRecForm(blankRec); setRecEditId(null); setShowRecForm(false);
   }
-  function editRec(r){setRecForm({...r,monto:String(r.monto)});setRecEditId(r.id);setShowRecForm(true);}
+  function editRec(r){setRecForm({...r,monto:String(r.monto),mesAnual:r.mesAnual||1,diaAnual:r.diaAnual||1,fechaInicioQuincenal:r.fechaInicioQuincenal||todayStr(),fechaInicioCatorcenal:r.fechaInicioCatorcenal||todayStr()});setRecEditId(r.id);setShowRecForm(true);}
   function delRec(id){setGastosRec(gastosRec.filter(r=>r.id!==id));}
 
   const diasSem=[{v:1,l:'Lunes'},{v:2,l:'Martes'},{v:3,l:'Miércoles'},{v:4,l:'Jueves'},{v:5,l:'Viernes'},{v:6,l:'Sábado'},{v:7,l:'Domingo'}];
   const frecLabel=(r)=>{
     if(r.frecuencia==='Semanal')return `Semanal · ${diasSem.find(d=>d.v===r.diaCobro)?.l||''}`;
+    if(r.frecuencia==='Quincenal')return `Quincenal · desde ${fmtDate(r.fechaInicioQuincenal)||'cada 1 y 15'}`;
+    if(r.frecuencia==='Catorcenal')return `Catorcenal · ${diasSem.find(d=>d.v===r.diaCobro)?.l||''} c/14 días`;
     if(r.frecuencia==='Mensual')return `Mensual · día ${r.diaCobro}`;
+    if(r.frecuencia==='Anual')return `Anual · ${MESES[(r.mesAnual||1)-1]} día ${r.diaAnual||1}`;
     if(r.frecuencia==='Fecha específica')return `Una vez · ${fmtDate(r.fechaEspecifica)}`;
     return r.frecuencia;
   };
@@ -682,7 +850,7 @@ function GastosTab({gastos,setGastos,gastosRec,setGastosRec,tdc,ingresos}){
               placeholder="ej. Supermercado, Gasolina..."/>
           </div>
           <div className="grid grid-cols-2 gap-3">
-            <button onClick={()=>setForm({...form,tipoPago:'efectivo'})}
+            <button onClick={()=>setForm({...form,tipoPago:'efectivo',meses:1})}
               className={`py-3 rounded-xl font-bold text-sm border-2 transition-all ${form.tipoPago==='efectivo'?'bg-blue-600 text-white border-blue-600':'bg-white text-slate-500 border-slate-200 hover:border-blue-200'}`}>
               💵 Efectivo
             </button>
@@ -691,6 +859,21 @@ function GastosTab({gastos,setGastos,gastosRec,setGastosRec,tdc,ingresos}){
               💳 Tarjeta
             </button>
           </div>
+          {form.tipoPago==='tarjeta'&&(
+            <div>
+              <label className="text-xs text-slate-500 font-semibold">Meses de financiamiento</label>
+              <div className="flex items-center gap-3 mt-1">
+                <input type="number" min="1" max="60" value={form.meses}
+                  onChange={e=>setForm({...form,meses:Math.max(1,parseInt(e.target.value)||1)})}
+                  className="w-20 border-2 border-purple-200 rounded-xl px-3 py-2 focus:border-purple-400 outline-none text-sm font-bold text-center text-purple-700"/>
+                <span className="text-xs text-slate-500 flex-1">
+                  {parseInt(form.meses)<=1
+                    ?'Pago único (sin financiamiento)'
+                    :`${form.meses} cuotas de ${fmt((parseFloat(form.monto)||0)/parseInt(form.meses||1))}/mes`}
+                </span>
+              </div>
+            </div>
+          )}
           <button onClick={addGasto} className="w-full py-3 bg-red-500 text-white rounded-xl font-bold hover:bg-red-600">
             Registrar gasto
           </button>
@@ -726,7 +909,7 @@ function GastosTab({gastos,setGastos,gastosRec,setGastosRec,tdc,ingresos}){
                   <select value={recForm.frecuencia} onChange={e=>setRecForm({...recForm,frecuencia:e.target.value,diaCobro:1})}
                     className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-sky-400 outline-none text-sm bg-white">
                     <option>Semanal</option><option>Quincenal</option>
-                    <option>Mensual</option><option>Fin de Mes</option>
+                    <option>Catorcenal</option><option>Mensual</option><option>Anual</option>
                   </select>
                 </div>
                 {recForm.frecuencia==='Semanal'&&(
@@ -744,6 +927,48 @@ function GastosTab({gastos,setGastos,gastosRec,setGastosRec,tdc,ingresos}){
                     <input type="number" min="1" max="31" value={recForm.diaCobro}
                       onChange={e=>setRecForm({...recForm,diaCobro:parseInt(e.target.value)})}
                       className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-sky-400 outline-none text-sm"/>
+                  </div>
+                )}
+                {recForm.frecuencia==='Quincenal'&&(
+                  <div className="col-span-2">
+                    <label className="text-xs text-slate-500 font-semibold">Fecha del primer pago</label>
+                    <input type="date" value={recForm.fechaInicioQuincenal} onChange={e=>setRecForm({...recForm,fechaInicioQuincenal:e.target.value})}
+                      className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-sky-400 outline-none text-sm"/>
+                    <p className="text-xs text-slate-400 mt-1">A partir de esta fecha se pagará cada 15 días.</p>
+                  </div>
+                )}
+                {recForm.frecuencia==='Catorcenal'&&(
+                  <div className="col-span-2 space-y-2">
+                    <div>
+                      <label className="text-xs text-slate-500 font-semibold">Día de la semana</label>
+                      <select value={recForm.diaCobro} onChange={e=>setRecForm({...recForm,diaCobro:parseInt(e.target.value)})}
+                        className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-sky-400 outline-none text-sm bg-white">
+                        {diasSem.map(d=><option key={d.v} value={d.v}>{d.l}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs text-slate-500 font-semibold">Fecha del primer pago</label>
+                      <input type="date" value={recForm.fechaInicioCatorcenal} onChange={e=>setRecForm({...recForm,fechaInicioCatorcenal:e.target.value})}
+                        className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-sky-400 outline-none text-sm"/>
+                      <p className="text-xs text-slate-400 mt-1">A partir de esta fecha se pagará cada 14 días.</p>
+                    </div>
+                  </div>
+                )}
+                {recForm.frecuencia==='Anual'&&(
+                  <div className="col-span-2 grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-xs text-slate-500 font-semibold">Mes</label>
+                      <select value={recForm.mesAnual} onChange={e=>setRecForm({...recForm,mesAnual:parseInt(e.target.value)})}
+                        className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-sky-400 outline-none text-sm bg-white">
+                        {MESES.map((m,i)=><option key={i+1} value={i+1}>{m}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs text-slate-500 font-semibold">Día (1–31)</label>
+                      <input type="number" min="1" max="31" value={recForm.diaAnual}
+                        onChange={e=>setRecForm({...recForm,diaAnual:parseInt(e.target.value)||1})}
+                        className="w-full border-2 border-slate-200 rounded-xl px-3 py-2 mt-1 focus:border-sky-400 outline-none text-sm"/>
+                    </div>
                   </div>
                 )}
                 <div className="col-span-2">
@@ -1007,19 +1232,17 @@ function TDCTab({state,setTDC}){
   payDate.setDate(payDate.getDate()+(parseInt(tdc.diasGracia)||20));
   const payDateS=dateStr(payDate);
 
-  const incomeBeforeCutoff=useMemo(()=>{
-    const evts=getEvents(today,nextCutoffS,ingresos,[],tdc,gastosRec);
-    return Object.values(evts).flat().filter(e=>e.tipo==='ingreso').reduce((s,e)=>s+e.monto,0);
-  },[today,nextCutoffS,ingresos,tdc,gastosRec]);
-
-  const nowState=useMemo(()=>computeState(today,saldoInicial,ingresos,gastos,tdc,gastosRec),[today,saldoInicial,ingresos,gastos,tdc,gastosRec]);
+  // State at cutoff: cash after all income, expenses, taxes and previous TDC cycle payments.
+  // tdcBal at cutoff = charges accumulated in the current billing cycle (not yet paid).
+  const stateAtCutoff=useMemo(()=>computeState(nextCutoffS,saldoInicial,ingresos,gastos,tdc,gastosRec),[nextCutoffS,saldoInicial,ingresos,gastos,tdc,gastosRec]);
   const compraN=parseFloat(compra)||0;
-  const totalTDC=(parseFloat(tdc.saldo)||0)+compraN;
-  const disponible=nowState.free+incomeBeforeCutoff;
+  const tdcAlCorte=stateAtCutoff.tdcBal;
+  const totalTDC=tdcAlCorte+compraN;
+  const disponible=stateAtCutoff.free;
   const diff=disponible-totalTDC;
   const puedePagar=diff>=0;
   const creditoDisp=(parseFloat(tdc.limite)||0)-(parseFloat(tdc.saldo)||0);
-  const cabeEnTDC=compraN<=creditoDisp;
+  const cabeEnTDC=compraN<=(parseFloat(tdc.limite)||0)-tdcAlCorte;
 
   return(
     <div className="space-y-4">
@@ -1082,39 +1305,31 @@ function TDCTab({state,setTDC}){
 
           {(compraN>0||true)&&(
             <div className="space-y-2">
-              <div className="flex justify-between items-center p-3 bg-slate-50 rounded-xl border border-slate-200">
-                <span className="text-sm text-slate-600">Saldo TDC actual</span>
-                <span className="font-bold text-red-600">{fmt(tdc.saldo)}</span>
-              </div>
-              {compraN>0&&<div className="flex justify-between items-center p-3 bg-slate-50 rounded-xl border border-slate-200">
-                <span className="text-sm text-slate-600">+ Compra a realizar</span>
-                <span className="font-bold text-red-500">+{fmt(compraN)}</span>
-              </div>}
-              <div className="flex justify-between items-center p-3 bg-red-50 rounded-xl border border-red-200">
-                <span className="text-sm font-bold text-red-700">= Total a pagar TDC</span>
-                <span className="font-bold text-red-700">{fmt(totalTDC)}</span>
+              <div className="flex justify-between items-center p-3 bg-emerald-50 rounded-xl border border-emerald-200">
+                <span className="text-sm font-bold text-emerald-700">Efectivo libre al corte <span className="font-normal text-xs text-emerald-500">({fmtDate(nextCutoffS)})</span></span>
+                <span className="font-bold text-emerald-700">{fmt(disponible)}</span>
               </div>
               <div className="border-t border-dashed border-slate-200 my-1"/>
               <div className="flex justify-between items-center p-3 bg-slate-50 rounded-xl border border-slate-200">
-                <span className="text-sm text-slate-600">Tu efectivo libre hoy</span>
-                <span className="font-bold text-blue-600">{fmt(nowState.free)}</span>
+                <span className="text-sm text-slate-600">Saldo TDC acumulado al corte</span>
+                <span className="font-bold text-red-600">−{fmt(tdcAlCorte)}</span>
               </div>
-              <div className="flex justify-between items-center p-3 bg-slate-50 rounded-xl border border-slate-200">
-                <span className="text-sm text-slate-600">+ Ingresos antes del corte ({fmtDate(nextCutoffS)})</span>
-                <span className="font-bold text-emerald-600">+{fmt(incomeBeforeCutoff)}</span>
-              </div>
-              <div className="flex justify-between items-center p-3 bg-emerald-50 rounded-xl border border-emerald-200">
-                <span className="text-sm font-bold text-emerald-700">= Disponible para pagar</span>
-                <span className="font-bold text-emerald-700">{fmt(disponible)}</span>
+              {compraN>0&&<div className="flex justify-between items-center p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <span className="text-sm text-slate-600">+ Compra a analizar</span>
+                <span className="font-bold text-red-500">−{fmt(compraN)}</span>
+              </div>}
+              <div className="flex justify-between items-center p-3 bg-red-50 rounded-xl border border-red-200">
+                <span className="text-sm font-bold text-red-700">= Total TDC a liquidar al corte</span>
+                <span className="font-bold text-red-700">{fmt(totalTDC)}</span>
               </div>
 
               <div className={`p-4 rounded-2xl border-2 ${puedePagar&&cabeEnTDC?'bg-emerald-50 border-emerald-300':'bg-red-50 border-red-300'}`}>
                 <p className={`font-bold text-base ${puedePagar&&cabeEnTDC?'text-emerald-700':'text-red-700'}`}>
                   {puedePagar&&cabeEnTDC
-                    ?`✅ SÍ puedes — después de pagar la TDC te sobrarán ${fmt(diff)}.`
+                    ?`✅ SÍ puedes — al liquidar la TDC te sobrarán ${fmt(diff)}.`
                     :!cabeEnTDC
-                    ?`❌ NO cabe en tu crédito disponible (${fmt(creditoDisp)}).`
-                    :`❌ NO alcanza — te faltan ${fmt(-diff)} para cubrir la TDC.`}
+                    ?`❌ NO cabe en tu crédito disponible al corte (${fmt((parseFloat(tdc.limite)||0)-tdcAlCorte)}).`
+                    :`❌ NO alcanza — te faltan ${fmt(-diff)} para cubrir la TDC al corte.`}
                 </p>
                 {puedePagar&&compraN>0&&cabeEnTDC&&(
                   <p className="text-xs text-emerald-600 mt-1">
@@ -1123,7 +1338,7 @@ function TDCTab({state,setTDC}){
                 )}
                 {!puedePagar&&compraN>0&&cabeEnTDC&&(
                   <p className="text-xs text-red-600 mt-1">
-                    Puedes hacer una compra de máximo {fmt(Math.max(0,disponible-parseFloat(tdc.saldo)))} sin riesgo.
+                    Compra máxima sin riesgo: {fmt(Math.max(0,disponible-tdcAlCorte))}.
                   </p>
                 )}
               </div>
@@ -1300,11 +1515,17 @@ function App(){
               {new Date().toLocaleDateString('es-MX',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}
             </p>
           </div>
-          <button
-            onClick={()=>{if(confirm('¿Borrar todos los datos y empezar de cero?'))setState(DEFAULT);}}
-            className="text-slate-500 hover:text-red-400 text-xs px-2 py-1 rounded-lg hover:bg-slate-700 transition-colors">
-            Reiniciar
-          </button>
+          <div className="flex flex-col items-end gap-1.5">
+            <a href="#" target="_blank" rel="noopener noreferrer"
+              className="text-yellow-400 hover:text-yellow-200 text-xs px-2.5 py-1 rounded-lg bg-yellow-500/10 hover:bg-yellow-500/20 border border-yellow-500/30 transition-colors font-semibold whitespace-nowrap">
+              ❤️ ¿Te gusta? Donar
+            </a>
+            <button
+              onClick={()=>{if(confirm('¿Borrar todos los datos y empezar de cero?'))setState(DEFAULT);}}
+              className="text-slate-500 hover:text-red-400 text-xs px-2 py-1 rounded-lg hover:bg-slate-700 transition-colors">
+              Reiniciar
+            </button>
+          </div>
         </div>
       </div>
 
